@@ -55,6 +55,31 @@ hwlog logs --boot -1 --tail 50  # structured logs from the latest boot
 hwlog crashes --last            # full decoded crash artifact, if it crashed
 ```
 
+### What a crash looks like
+
+The whole point of the flash-time ELF archive: when the board panics, you get
+source lines, not addresses. Representative output:
+
+```
+$ hwlog crashes --last
+crash 1: Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+--- raw ---
+Guru Meditation Error: Core  1 panic'ed (LoadProhibited). Exception was unhandled.
+Core  1 register dump:
+PC      : 0x400d1234  PS      : 0x00060530  A0      : 0x800d5678  A1      : 0x3ffb1230
+Backtrace: 0x400d1234:0x3ffb1234 0x400d5678:0x3ffb5678 0x400dabcd:0x3ffb9abc
+Rebooting...
+--- decoded backtrace ---
+0x400d1234: sensor_read_task at main/sensor.c:87
+0x400d5678: read_i2c_register at main/i2c_helpers.c:41
+0x400dabcd: vTaskDelay at freertos/tasks.c:1456
+```
+
+The artifact is assembled from the multi-line panic dump (register dump,
+backtrace, reboot marker) and symbolized with `addr2line` against the ELF
+archived by the most recent `hwlog flash`. No archived ELF yet? The raw
+addresses are kept and the report says why decoding was skipped.
+
 ### For coding agents
 
 ```bash
@@ -71,18 +96,10 @@ Agents get `query_logs`, `list_boots`, `get_crash`, `wait_for_pattern`, `send_to
 
 Session data and the local daemon control channel are owner-only. Metadata writes are atomic, selectors cannot escape the session root, and ambiguous multi-board selections require an explicit port.
 
-Storage is bounded by default: a session may retain 512 MiB and the complete
-`HWLOG_DIR` may retain 4 GiB. When the session log budget is exhausted, capture
-keeps the serial connection alive, stops growing `raw.log`/`log.jsonl`, reserves
-space for bounded crash evidence, and records drop counters in `meta.json` and
-`hwlog status`. Global cleanup removes only aged, unreferenced archived ELFs and the
-oldest completed sessions; active sessions and paths outside the validated
-hwlog root are never deleted. Configure byte limits with
-`HWLOG_MAX_SESSION_BYTES` and `HWLOG_MAX_TOTAL_BYTES` (zero is fail-closed).
-
-CLI log/boot queries scan the newest 64 MiB by default and warn when older
-history was omitted. Override per call with `--scan-bytes` or globally with
-`HWLOG_QUERY_SCAN_BYTES`.
+Storage and query scans are bounded by default (512 MiB per session, 4 GiB
+total, 64 MiB query scan window) — see [storage limits](./docs/cli.md#storage-limits)
+and [architecture](./docs/architecture.md) for budgets, drop counters, and the
+`HWLOG_MAX_*` / `HWLOG_QUERY_SCAN_BYTES` overrides.
 
 ## The agent debug loop
 
