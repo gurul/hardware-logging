@@ -40,6 +40,15 @@ DEFAULT_MAX_SESSION_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_CRASH_RESERVE_BYTES = 8 * 1024 * 1024
 GLOBAL_USAGE_RECHECK_BYTES = 4 * 1024 * 1024
+# Prepaid per-writer quota allowance. Writes are debited locally and the
+# cross-process quota lock + counter fsync is taken only to refill, keeping
+# both off the capture hot path (a concurrent global prune holding the lock
+# could otherwise stall capture until the OS tty buffer overflows). The
+# shared counter may transiently deviate from disk by up to one chunk per
+# live writer (unused allowance is released on close; every disk reconcile
+# rebounds the drift), so the effective global limit is exact only to within
+# that slack — a deliberate trade against dropping serial bytes.
+QUOTA_ALLOWANCE_CHUNK_BYTES = 1024 * 1024
 MAX_STORAGE_SCAN_ENTRIES = 200_000
 UNREFERENCED_ELF_GRACE_SECONDS = 300
 _USAGE_COUNTER_BYTES = 32
@@ -607,6 +616,7 @@ class SessionWriter:
         self._global_usage = global_usage
         self._global_scan_complete = global_scan_complete
         self._global_since_check = 0
+        self._global_allowance = 0
         self._drop_checkpoint = (
             meta.dropped_raw_bytes // (1024 * 1024),
             meta.dropped_records // 1000,
@@ -665,17 +675,16 @@ class SessionWriter:
             self._ensure_open()
             if not data:
                 return
-            with storage_quota_guard():
-                reason = self._reserve_storage_unlocked(len(data), log_data=True)
-                if reason is not None:
-                    self._mark_storage_drop_unlocked(reason, raw_bytes=len(data))
-                    return
-                try:
-                    self._raw.write(data)
-                    self._raw.flush()
-                except BaseException:
-                    self._release_storage_unlocked(len(data), log_data=True, reconcile=True)
-                    raise
+            reason = self._reserve_storage_unlocked(len(data), log_data=True)
+            if reason is not None:
+                self._mark_storage_drop_unlocked(reason, raw_bytes=len(data))
+                return
+            try:
+                self._raw.write(data)
+                self._raw.flush()
+            except BaseException:
+                self._refund_storage_unlocked(len(data), log_data=True)
+                raise
 
     def write_crash(self, report: CrashReport) -> Path:
         with self._lock:
@@ -684,18 +693,17 @@ class SessionWriter:
             path = self.dir / "crashes" / f"{self.meta.crashes:03d}.json"
             payload = json.dumps(_bounded_crash_dict(report), indent=2, ensure_ascii=False)
             payload_size = len(payload.encode("utf-8"))
-            with storage_quota_guard():
-                reason = self._reserve_storage_unlocked(payload_size, log_data=False)
-                if reason is not None:
-                    self._mark_storage_drop_unlocked(reason, crash=True)
-                    return path
-                try:
-                    atomic_write_text(path, payload)
-                except BaseException:
-                    self._release_storage_unlocked(payload_size, log_data=False)
-                    self.meta.crashes -= 1
-                    raise
-                self._write_meta_unlocked()
+            reason = self._reserve_storage_unlocked(payload_size, log_data=False)
+            if reason is not None:
+                self._mark_storage_drop_unlocked(reason, crash=True)
+                return path
+            try:
+                atomic_write_text(path, payload)
+            except BaseException:
+                self._refund_storage_unlocked(payload_size, log_data=False)
+                self.meta.crashes -= 1
+                raise
+            self._write_meta_unlocked()
             return path
 
     def update_crash(self, path: Path, report: CrashReport) -> None:
@@ -712,18 +720,17 @@ class SessionWriter:
             except OSError:
                 previous_size = 0
             growth = max(0, payload_size - previous_size)
-            with storage_quota_guard():
-                reason = self._reserve_storage_unlocked(growth, log_data=False)
-                if reason is not None:
-                    self._mark_storage_drop_unlocked(reason)
-                    return
-                try:
-                    atomic_write_text(resolved, payload)
-                except BaseException:
-                    self._release_storage_unlocked(growth, log_data=False)
-                    raise
-                if payload_size < previous_size:
-                    self._release_storage_unlocked(previous_size - payload_size, log_data=False)
+            reason = self._reserve_storage_unlocked(growth, log_data=False)
+            if reason is not None:
+                self._mark_storage_drop_unlocked(reason)
+                return
+            try:
+                atomic_write_text(resolved, payload)
+            except BaseException:
+                self._refund_storage_unlocked(growth, log_data=False)
+                raise
+            if payload_size < previous_size:
+                self._refund_storage_unlocked(previous_size - payload_size, log_data=False)
 
     def note_boot(self) -> int:
         with self._lock:
@@ -826,11 +833,22 @@ class SessionWriter:
                 finally:
                     self._raw.close()
                     self._closed = True
+                    allowance, self._global_allowance = self._global_allowance, 0
+                    if allowance > 0:
+                        # Return the unused prepaid quota. Best-effort: after a
+                        # crash the periodic disk reconcile reclaims it instead.
+                        with contextlib.suppress(OSError):
+                            with storage_quota_guard():
+                                release_global_bytes_locked(allowance)
 
     # -- internals ---------------------------------------------------------
 
     def _reserve_storage_unlocked(self, amount: int, *, log_data: bool) -> str | None:
-        """Reserve bytes, returning a stable cap reason when no space remains."""
+        """Reserve bytes, returning a stable cap reason when no space remains.
+
+        The shared quota lock is touched only when the local allowance needs a
+        refill; ordinary writes are debited without any cross-process work.
+        """
         if amount <= 0:
             return None
         if log_data and self.meta.storage_capped:
@@ -839,45 +857,56 @@ class SessionWriter:
             return "session_limit"
         if self._session_data_bytes + amount > self._session_limit:
             return "session_limit"
-
-        must_recheck = (
-            not self._global_scan_complete
-            or self._global_since_check >= GLOBAL_USAGE_RECHECK_BYTES
-            or self._global_usage + amount > self._total_limit
-        )
-        reserved, usage, complete = reserve_global_bytes_locked(
-            amount,
-            self._total_limit,
-            force_reconcile=must_recheck,
-            protected={self.dir},
-        )
-        self._global_usage = usage
-        self._global_scan_complete = complete
-        if must_recheck:
-            self._global_since_check = 0
-        if not reserved:
+        if self._global_allowance < amount and not self._refill_allowance(amount):
             return "global_limit"
 
+        self._global_allowance -= amount
         self._session_data_bytes += amount
         self._global_since_check += amount
         if log_data:
             self._log_bytes += amount
         return None
 
-    def _release_storage_unlocked(
-        self, amount: int, *, log_data: bool, reconcile: bool = False
-    ) -> None:
+    def _refill_allowance(self, amount: int) -> bool:
+        """Top up the prepaid allowance from the shared counter (takes the guard)."""
+        needed = amount - self._global_allowance
+        attempts = [max(needed, QUOTA_ALLOWANCE_CHUNK_BYTES)]
+        if attempts[0] > needed:
+            # Near the global limit a full chunk may not fit; fall back to the
+            # exact need so accuracy (not throughput) wins at the boundary.
+            attempts.append(needed)
+        with storage_quota_guard():
+            must_recheck = (
+                not self._global_scan_complete
+                or self._global_since_check >= GLOBAL_USAGE_RECHECK_BYTES
+            )
+            for attempt in attempts:
+                # A forced reconcile rewrites the counter from disk, dropping
+                # this writer's own unspent allowance — re-reserve it with the
+                # refill so it stays represented in the shared counter.
+                request = attempt + (self._global_allowance if must_recheck else 0)
+                reserved, usage, complete = reserve_global_bytes_locked(
+                    request,
+                    self._total_limit,
+                    force_reconcile=must_recheck,
+                    protected={self.dir},
+                )
+                self._global_usage = usage
+                self._global_scan_complete = complete
+                if must_recheck:
+                    self._global_since_check = 0
+                    must_recheck = False
+                if reserved:
+                    self._global_allowance += attempt
+                    return True
+        return False
+
+    def _refund_storage_unlocked(self, amount: int, *, log_data: bool) -> None:
+        """Return a failed or shrunk reservation to the prepaid allowance."""
         if amount <= 0:
             return
+        self._global_allowance += amount
         self._session_data_bytes = max(0, self._session_data_bytes - amount)
-        self._global_usage = max(0, self._global_usage - amount)
-        if reconcile:
-            self._global_usage, self._global_scan_complete = reconcile_global_usage_locked(
-                self._total_limit, protected={self.dir}
-            )
-            self._global_since_check = 0
-        else:
-            release_global_bytes_locked(amount)
         if log_data:
             self._log_bytes = max(0, self._log_bytes - amount)
 
@@ -925,17 +954,16 @@ class SessionWriter:
     def _write_record_unlocked(self, record: LogRecord) -> None:
         payload = record.to_json() + "\n"
         payload_size = len(payload.encode("utf-8"))
-        with storage_quota_guard():
-            reason = self._reserve_storage_unlocked(payload_size, log_data=True)
-            if reason is not None:
-                self._mark_storage_drop_unlocked(reason, record=True)
-                return
-            try:
-                self._log.write(payload)
-                self._log.flush()
-            except BaseException:
-                self._release_storage_unlocked(payload_size, log_data=True, reconcile=True)
-                raise
+        reason = self._reserve_storage_unlocked(payload_size, log_data=True)
+        if reason is not None:
+            self._mark_storage_drop_unlocked(reason, record=True)
+            return
+        try:
+            self._log.write(payload)
+            self._log.flush()
+        except BaseException:
+            self._refund_storage_unlocked(payload_size, log_data=True)
+            raise
 
     def _ensure_open(self) -> None:
         if self._closed:

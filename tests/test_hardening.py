@@ -514,7 +514,28 @@ def test_session_writer_rejects_unpersistable_storage_limit(monkeypatch) -> None
         SessionWriter(_meta())
 
 
-def test_session_cap_drops_logs_but_reserves_space_for_crash_status(monkeypatch) -> None:
+def test_hot_path_writes_do_not_take_the_quota_lock_per_write(monkeypatch) -> None:
+    monkeypatch.setenv("HWLOG_MAX_TOTAL_BYTES", str(64 * 1024 * 1024))
+    writer = SessionWriter(_meta())
+    acquisitions = 0
+    original_guard = session_mod.storage_quota_guard
+
+    def counting_guard():
+        nonlocal acquisitions
+        acquisitions += 1
+        return original_guard()
+
+    monkeypatch.setattr(session_mod, "storage_quota_guard", counting_guard)
+    try:
+        for seq in range(200):
+            writer.write_raw(b"raw serial chunk\n")
+            writer.write_record(_record(seq + 1, f"line {seq}"))
+    finally:
+        writer.close()
+
+    # 400 small writes fit inside one prepaid allowance chunk: at most one
+    # refill plus the close-time release may touch the cross-process lock.
+    assert acquisitions <= 2
     monkeypatch.setenv("HWLOG_MAX_SESSION_BYTES", "1024")
     monkeypatch.setenv("HWLOG_MAX_TOTAL_BYTES", str(10 * 1024 * 1024))
     writer = SessionWriter(_meta())

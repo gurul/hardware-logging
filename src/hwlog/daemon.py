@@ -42,6 +42,10 @@ from .session import (
 
 SOCK_TIMEOUT_S = 5.0
 PAUSE_TIMEOUT_S = 5.0
+# Hard ceiling on how long a flash pause may keep capture off. Backs up the
+# owner-PID liveness check: if the flasher's PID is reused by a long-lived
+# process, the lease would otherwise never be recovered.
+PAUSE_LEASE_MAX_S = 600.0
 STOP_TIMEOUT_S = 15.0
 MAX_CONTROL_BYTES = 16 * 1024
 MAX_NOTE_CHARS = 4096
@@ -202,7 +206,7 @@ def _read_state_bytes(path: Path, expected_inode: tuple[int, int]) -> bytes:
             os.close(fd)
 
 
-def _valid_legacy_state(
+def _legacy_state_fields_ok(
     path: Path,
     raw: dict,
     *,
@@ -210,9 +214,9 @@ def _valid_legacy_state(
     port: object,
     sock: object,
     session: object,
-) -> dict | None:
-    """Preserve a live pre-authentication daemon without trusting its controls."""
-    if (
+) -> bool:
+    """Structurally complete legacy state (says nothing about liveness)."""
+    return not (
         raw.get("schema_version") is not None
         or raw.get("instance") is not None
         or isinstance(pid, bool)
@@ -226,8 +230,22 @@ def _valid_legacy_state(
         or len(sock) > 4096
         or len(session) > 4096
         or path.stem != _legacy_port_slug(port)
-        or not _pid_alive(pid)
-    ):
+    )
+
+
+def _valid_legacy_state(
+    path: Path,
+    raw: dict,
+    *,
+    pid: object,
+    port: object,
+    sock: object,
+    session: object,
+) -> dict | None:
+    """Preserve a live pre-authentication daemon without trusting its controls."""
+    if not _legacy_state_fields_ok(path, raw, pid=pid, port=port, sock=sock, session=session):
+        return None
+    if not _pid_alive(pid):
         return None
     try:
         expected_sock = daemon_dir() / f"{path.stem}.sock"
@@ -290,8 +308,19 @@ def _read_valid_state(path: Path) -> dict | None:
         )
         if legacy is not None:
             return legacy
-        # Unknown no-token state may belong to a live released daemon. Preserve
-        # it and make startup fail closed until an operator verifies it.
+        if (
+            _legacy_state_fields_ok(path, raw, pid=pid, port=port, sock=sock, session=session)
+            and not _pid_alive(pid)
+            and not _daemon_lock_is_held(path.stem)
+        ):
+            # Structurally complete legacy state whose recorded owner is
+            # provably dead: cleaning it cannot orphan a live daemon, and
+            # preserving it would block every future start.
+            _cleanup_state_file(path, expected_inode)
+            return None
+        # Other no-token state may belong to a live released daemon (for
+        # example a torn mid-write file). Preserve it and make startup fail
+        # closed until an operator verifies it.
         return None
     if raw.get("schema_version") != STATE_SCHEMA_VERSION:
         # A future/unknown authenticated protocol must not receive current
@@ -378,7 +407,7 @@ def _state_snapshot() -> tuple[tuple[str, int, int, int, int], ...]:
     return tuple(sorted(snapshot))
 
 
-def _legacy_conflicts(state: dict, port_spec: str | None) -> bool:
+def _legacy_conflicts(state: dict) -> bool:
     if state.get("legacy") is not True:
         return False
     # Legacy state has no physical USB identity or ownership lock. Distinct
@@ -424,7 +453,7 @@ def _assert_legacy_start_safe(
             time.sleep(0.05)
     else:
         raise DaemonError("daemon state is changing; retry after the existing daemon settles")
-    if any(_legacy_conflicts(state, port_spec) for state in states):
+    if any(_legacy_conflicts(state) for state in states):
         raise DaemonError(
             "a legacy daemon may still own this serial port; stop it with the previously installed "
             "hwlog version, or verify and terminate its recorded PID, then retry"
@@ -595,6 +624,7 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
         state_created = True
         pause_lease: str | None = None
         pause_owner_pid: int | None = None
+        pause_started: float | None = None
         pause_guard = threading.Lock()
 
         def handle(conn: socket.socket) -> None:
@@ -621,7 +651,7 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
                     conn.sendall(payload)
 
         def dispatch(req: dict) -> dict:
-            nonlocal pause_lease, pause_owner_pid
+            nonlocal pause_lease, pause_owner_pid, pause_started
             if req.get("instance") != state["instance"]:
                 return {"ok": False, "error": "invalid daemon instance token"}
             cmd = req.get("cmd")
@@ -670,11 +700,13 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
                         }
                     pause_lease = lease
                     pause_owner_pid = owner_pid
+                    pause_started = time.monotonic()
                     ok = loop.pause(timeout=PAUSE_TIMEOUT_S)
                     if not ok:
                         loop.resume()
                         pause_lease = None
                         pause_owner_pid = None
+                        pause_started = None
                 return {"ok": ok, "error": None if ok else "timed out releasing serial port"}
             if cmd == "resume":
                 lease = req.get("lease")
@@ -690,6 +722,7 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
                     )
                     pause_lease = None
                     pause_owner_pid = None
+                    pause_started = None
                 return {"ok": True, "firmware_generation": generation}
             if cmd == "note":
                 message = req.get("message")
@@ -764,12 +797,25 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
         control.start()
 
         def recover_abandoned_pause() -> None:
-            nonlocal pause_lease, pause_owner_pid
+            nonlocal pause_lease, pause_owner_pid, pause_started
             while not loop.stop_event.wait(0.5):
                 with pause_guard:
-                    if pause_lease is not None and not _pid_alive(pause_owner_pid):
+                    if pause_lease is None:
+                        continue
+                    # The owner-PID check catches a dead flasher; the lease
+                    # deadline catches its PID being reused by a long-lived
+                    # process, which would otherwise leave capture off forever.
+                    expired = (
+                        pause_started is not None
+                        and time.monotonic() - pause_started > PAUSE_LEASE_MAX_S
+                    )
+                    if expired or not _pid_alive(pause_owner_pid):
                         pause_lease = None
                         pause_owner_pid = None
+                        pause_started = None
+                        # The abandoned flash may or may not have reached the
+                        # device. Assume it did: a lost decode is recoverable,
+                        # decoding against the wrong firmware's ELF is not.
                         loop.resume(awaiting_elf=True, record_flash_boundary=True)
 
         lease_watchdog = threading.Thread(
@@ -875,10 +921,27 @@ def stop_daemon(state: dict) -> bool:
         if not response.get("ok"):
             return False
     except (OSError, DaemonError):
-        # Never signal a PID from stale state: PID reuse makes that capable of
-        # terminating an unrelated process. Only an authenticated control
-        # response authorizes shutdown.
-        return False
+        # The control channel is unavailable or wedged. Never signal a PID
+        # from stale state — PID reuse makes that capable of terminating an
+        # unrelated process. But a freshly re-validated state proves the slug
+        # flock is held right now, and the flock holder is the process that
+        # recorded its own PID, so SIGTERM against that PID cannot land on a
+        # reused stranger. Without this fallback a daemon whose control
+        # thread is blocked can never be stopped by hwlog at all.
+        port = state.get("port")
+        if not isinstance(port, str):
+            return False
+        current = _read_valid_state(state_path(port_slug(port)))
+        if (
+            current is None
+            or current.get("pid") != pid
+            or current.get("instance") != state.get("instance")
+        ):
+            return False
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return False
 
     for _ in range(int(STOP_TIMEOUT_S * 10)):
         if not _pid_alive(pid):
