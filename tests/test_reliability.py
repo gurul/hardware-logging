@@ -847,6 +847,16 @@ def test_concurrent_flash_attempt_is_rejected(monkeypatch, tmp_path):
     assert first_result == [0]
 
 
+def test_flash_selector_matches_normalized_port_fragments(monkeypatch):
+    states = [{"port": "/dev/ttyUSB2"}, {"port": "/dev/ttyUSB20"}]
+    monkeypatch.setattr(flash_mod.ports, "resolve_port", lambda _spec=None: None)
+
+    assert flash_mod._select_target_daemon(states, "usb20") is states[1]
+    assert flash_mod._select_target_daemon(states, "ttyusb20") is states[1]
+    with pytest.raises(flash_mod.daemon.AmbiguousDaemonError):
+        flash_mod._select_target_daemon(states, "usb2")
+
+
 def test_archive_elf_is_owner_only_and_refuses_source_symlinks(tmp_path):
     source = tmp_path / "firmware.elf"
     source.write_bytes(b"ELF payload")
@@ -862,7 +872,9 @@ def test_archive_elf_is_owner_only_and_refuses_source_symlinks(tmp_path):
 
     selected_digest = flash_mod.hashlib.sha256(source.read_bytes()).hexdigest()
     source.write_bytes(b"changed after selection")
-    with pytest.raises(OSError, match="changed after it was selected"):
+    # A logical condition, not an OS failure — ValueError, unlike the
+    # symlink refusal above which surfaces the OS-level O_NOFOLLOW error.
+    with pytest.raises(ValueError, match="changed after it was selected"):
         flash_mod.archive_elf(source, expected_digest=selected_digest)
 
 

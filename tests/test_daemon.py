@@ -359,6 +359,78 @@ def test_abandoned_pause_lease_is_recovered(running_daemon):
             owner.kill()
 
 
+def test_pause_lease_expires_even_with_a_live_owner_pid(running_daemon, monkeypatch):
+    state, _state_file, _thread = running_daemon
+    monkeypatch.setattr(daemon, "PAUSE_LEASE_MAX_S", 0.3)
+    owner = subprocess.Popen(["sleep", "30"])
+    lease = "e" * 32
+    try:
+        assert (
+            daemon.send_cmd(state, {"cmd": "pause", "lease": lease, "owner_pid": owner.pid})["ok"]
+            is True
+        )
+        # The owner stays alive, so only the lease deadline can recover this.
+        deadline = time.monotonic() + 3
+        status = daemon.send_cmd(state, {"cmd": "status"})
+        while time.monotonic() < deadline and status["paused"]:
+            time.sleep(0.05)
+            status = daemon.send_cmd(state, {"cmd": "status"})
+        assert status["paused"] is False
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            owner.kill()
+        owner.wait(timeout=5)
+
+
+def test_stop_falls_back_to_sigterm_for_a_validated_wedged_daemon(running_daemon, monkeypatch):
+    state, _state_file, _thread = running_daemon
+    calls: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    def fake_kill(pid: int, sig: int):
+        if sig == 0:
+            return real_kill(pid, 0)
+        calls.append((pid, sig))
+        return None
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    monkeypatch.setattr(daemon, "STOP_TIMEOUT_S", 0.3)
+
+    def wedged(*_args, **_kwargs):
+        raise daemon.DaemonError("control thread is blocked")
+
+    monkeypatch.setattr(daemon, "send_cmd", wedged)
+
+    # The fallback re-validates state (flock held, same pid/instance) and then
+    # signals; the fake keeps the daemon alive so stop reports failure.
+    assert daemon.stop_daemon(state) is False
+    assert calls == [(state["pid"], signal.SIGTERM)]
+
+
+def test_stop_never_signals_when_revalidation_fails(running_daemon, monkeypatch):
+    state, _state_file, _thread = running_daemon
+    calls: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    def fake_kill(pid: int, sig: int):
+        if sig == 0:
+            return real_kill(pid, 0)
+        calls.append((pid, sig))
+        return None
+
+    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    monkeypatch.setattr(daemon, "STOP_TIMEOUT_S", 0.1)
+
+    def wedged(*_args, **_kwargs):
+        raise daemon.DaemonError("control thread is blocked")
+
+    monkeypatch.setattr(daemon, "send_cmd", wedged)
+    monkeypatch.setattr(daemon, "_read_valid_state", lambda _path: None)
+
+    assert daemon.stop_daemon(state) is False
+    assert calls == []
+
+
 def test_slow_control_client_does_not_block_status(running_daemon):
     state, _state_file, _thread = running_daemon
     slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -447,12 +519,9 @@ def test_live_legacy_daemon_is_preserved_and_new_control_refuses_it(monkeypatch)
             daemon.send_cmd(state, {"cmd": "status"})
         with pytest.raises(daemon.DaemonError, match="legacy daemon may still own"):
             daemon.run_daemon(port, 115200)
-        assert daemon._legacy_conflicts(state, "/dev/cu.usbmodem-other") is True
-        assert daemon._legacy_conflicts(state, "/dev/tty.usbmodem-legacy") is True
-        assert daemon._legacy_conflicts(state, "/dev/serial/by-id/legacy") is True
-        assert daemon._legacy_conflicts(state, "/dev/cu.usbmodem") is True
-        assert daemon._legacy_conflicts(state, "/dev/cu.usbmodem-legacy0") is True
-        assert daemon._legacy_conflicts(state, "usbmodem") is True
+        # Legacy state conflicts with every start; no selector can prove
+        # non-overlap against a daemon without physical-device identity.
+        assert daemon._legacy_conflicts(state) is True
 
         socket_calls = []
         monkeypatch.setattr(
@@ -467,6 +536,45 @@ def test_live_legacy_daemon_is_preserved_and_new_control_refuses_it(monkeypatch)
         state_file.unlink(missing_ok=True)
         sock_path.unlink(missing_ok=True)
         short_home.cleanup()
+
+
+def test_auto_start_refuses_a_running_explicit_port_daemon(monkeypatch):
+    monkeypatch.setattr(daemon, "list_daemons", lambda: [{"port": "/dev/ttyUSB0"}])
+    monkeypatch.setattr(daemon, "_assert_legacy_start_safe", lambda *_a, **_k: None)
+
+    with pytest.raises(daemon.DaemonError, match="explicit-port daemon"):
+        daemon.start_background(None, 115200)
+
+
+def test_dead_legacy_state_is_cleaned_and_does_not_block_start(monkeypatch):
+    short_home = tempfile.TemporaryDirectory(prefix="hwl-", dir="/tmp")
+    monkeypatch.setenv("HWLOG_DIR", short_home.name)
+    port = "/dev/cu.usbmodem-legacy"
+    slug = daemon._legacy_port_slug(port)
+    session = daemon.sessions_dir() / "legacy-session"
+    daemon.ensure_private_dir(session)
+    proc = subprocess.Popen(["true"])
+    proc.wait(timeout=5)
+    state_file = daemon.daemon_dir() / f"{slug}.json"
+    daemon.atomic_write_text(
+        state_file,
+        json.dumps(
+            {
+                "pid": proc.pid,
+                "port": port,
+                "baud": 115200,
+                "session": str(session),
+                "sock": str(daemon.daemon_dir() / f"{slug}.sock"),
+                "started_at": "2026-08-06T00:00:00.000Z",
+            }
+        ),
+    )
+
+    # A structurally complete legacy state whose recorded owner is provably
+    # dead is cleaned up instead of permanently blocking every future start.
+    assert daemon._read_valid_state(state_file) is None
+    assert not state_file.exists()
+    daemon._assert_no_unresolved_state_files()
 
 
 def test_current_selector_conflicts_fail_closed():

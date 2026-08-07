@@ -8,9 +8,9 @@ All query commands print compact text by default and NDJSON with `--json`. Exit 
 List serial ports, likely dev boards first (identified by USB VID: Espressif, CP210x, CH340, FTDI, RP2040, STM32, nRF, …).
 
 ### `hwlog start [--port SPEC] [--baud N]`
-Start the background capture daemon. `--port` accepts an exact path or a substring (`usbmodem` survives replug renumbering); omitted, the best board candidate is auto-detected. Idempotent — returns the existing daemon if one is running.
+Start the background capture daemon. `--port` accepts an exact path or a substring (`usbmodem` survives replug renumbering, matched case-insensitively against the normalized port name); omitted, the best board candidate is auto-detected. Idempotent for the same selection — repeating it returns the existing daemon. Mixing selection modes is refused in both directions: an explicit `--port` will not start alongside a running auto-select daemon, and auto-select will not silently adopt a running explicit-port daemon.
 
-After upgrading from a release with the older unauthenticated daemon protocol, live legacy state is preserved and new capture refuses to start alongside it. Stop that process with the previous `hwlog` version, or verify the recorded PID before terminating it manually.
+After upgrading from a release with the older unauthenticated daemon protocol, live legacy state is preserved and new capture refuses to start alongside it. Stop that process with the previous `hwlog` version, or verify the recorded PID before terminating it manually. State left by a provably dead legacy daemon is cleaned up automatically.
 
 ### `hwlog monitor [--port SPEC] [--baud N]`
 Foreground capture with live output. Records a full session exactly like the daemon. Ctrl-C to stop.
@@ -18,7 +18,10 @@ Foreground capture with live output. Records a full session exactly like the dae
 ### `hwlog stop [--port SPEC]` / `hwlog status [--json]`
 Stop the daemon / show daemon + session status. Status includes the configured
 session storage limit and persisted raw-byte, structured-record, and crash drop
-counters if capture reached a storage cap.
+counters if capture reached a storage cap. If the daemon's control channel is
+unresponsive, `stop` falls back to signaling the daemon process — only after
+re-validating through the daemon lock that the recorded PID is still the
+daemon's own, never a reused PID.
 
 ## Query
 
