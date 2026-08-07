@@ -1,0 +1,71 @@
+[project]
+name = "hardware-logging"
+version = "0.1.0"
+description = "Structured, crash-aware serial log capture for embedded boards, built for AI coding agents. Persistent sessions, bounded queries, decoded backtraces, MCP server."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Gurucharan Lingamallu" }]
+keywords = [
+    "esp32",
+    "embedded",
+    "serial",
+    "logging",
+    "mcp",
+    "claude",
+    "ai-agents",
+    "firmware",
+    "debugging",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Logging",
+]
+dependencies = [
+    "pyserial>=3.5",
+    "typer>=0.19",
+    "fastmcp>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/gurul/hardware-logging"
+Repository = "https://github.com/gurul/hardware-logging"
+Issues = "https://github.com/gurul/hardware-logging/issues"
+
+[project.scripts]
+hwlog = "hwlog.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hwlog"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's API takes defaults via function calls by design
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
