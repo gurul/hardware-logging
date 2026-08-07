@@ -538,6 +538,14 @@ def test_live_legacy_daemon_is_preserved_and_new_control_refuses_it(monkeypatch)
         short_home.cleanup()
 
 
+def test_auto_start_refuses_a_running_explicit_port_daemon(monkeypatch):
+    monkeypatch.setattr(daemon, "list_daemons", lambda: [{"port": "/dev/ttyUSB0"}])
+    monkeypatch.setattr(daemon, "_assert_legacy_start_safe", lambda *_a, **_k: None)
+
+    with pytest.raises(daemon.DaemonError, match="explicit-port daemon"):
+        daemon.start_background(None, 115200)
+
+
 def test_dead_legacy_state_is_cleaned_and_does_not_block_start(monkeypatch):
     short_home = tempfile.TemporaryDirectory(prefix="hwl-", dir="/tmp")
     monkeypatch.setenv("HWLOG_DIR", short_home.name)

@@ -629,6 +629,7 @@ class SessionWriter:
         except BaseException:
             self._log.close()
             self._closed = True
+            self._discard_partial_session_dir()
             raise
         try:
             (self.dir / "log.jsonl").chmod(0o600)
@@ -643,7 +644,19 @@ class SessionWriter:
             self._log.close()
             self._raw.close()
             self._closed = True
+            self._discard_partial_session_dir()
             raise
+
+    def _discard_partial_session_dir(self) -> None:
+        """Remove a just-created session dir whose init failed.
+
+        Without a valid meta.json the directory is invisible to list_sessions
+        and therefore unprunable, yet its bytes still count against the global
+        scan — permanent untracked usage. Best effort; the dir was created by
+        this constructor and holds nothing user-valuable yet.
+        """
+        with contextlib.suppress(OSError):
+            shutil.rmtree(self.dir)
 
     # -- record writing ----------------------------------------------------
 
@@ -686,7 +699,9 @@ class SessionWriter:
                 self._refund_storage_unlocked(len(data), log_data=True)
                 raise
 
-    def write_crash(self, report: CrashReport) -> Path:
+    def write_crash(self, report: CrashReport) -> Path | None:
+        """Persist a crash artifact; returns None when quota dropped it, so a
+        caller can never hold a path to a file that was never written."""
         with self._lock:
             self._ensure_open()
             self.meta.crashes += 1
@@ -695,8 +710,9 @@ class SessionWriter:
             payload_size = len(payload.encode("utf-8"))
             reason = self._reserve_storage_unlocked(payload_size, log_data=False)
             if reason is not None:
+                self.meta.crashes -= 1
                 self._mark_storage_drop_unlocked(reason, crash=True)
-                return path
+                return None
             try:
                 atomic_write_text(path, payload)
             except BaseException:

@@ -119,6 +119,18 @@ class CaptureLoop:
         self.stop_event.set()
         self._wake_event.set()
 
+    def dispose(self) -> None:
+        """Release background resources for a loop that never ran.
+
+        run() performs this teardown itself on exit; dispose() exists for
+        owners that constructed a loop and failed before starting it, so they
+        never need to reach into private members.
+        """
+        try:
+            self._decoder.shutdown(wait=False, cancel_futures=True)
+        finally:
+            self._release_device_ownership()
+
     def pause(self, timeout: float | None = None) -> bool:
         """Request a port release and optionally wait for the close acknowledgment."""
         self.pause_event.set()
@@ -539,13 +551,18 @@ class CaptureLoop:
 
     def _emit_crash(self, report: CrashReport) -> None:
         path = self.writer.write_crash(report)
+        extra = {"crash_id": report.crash_id}
+        if path is not None:
+            extra["file"] = str(path)
         self._record(
             Event.CRASH,
             msg=report.summary(),
             level="E",
-            extra={"crash_id": report.crash_id, "file": str(path)},
+            extra=extra,
         )
-        if report.backtrace_addrs:
+        # A quota-dropped artifact is gone; symbolizing it would recreate the
+        # file via update_crash and silently bypass the drop decision.
+        if path is not None and report.backtrace_addrs:
             with self._symbolization_lock:
                 self._unresolved_crashes[report.crash_id] = (
                     self._firmware_generation,
@@ -553,7 +570,9 @@ class CaptureLoop:
                     path,
                 )
                 while len(self._unresolved_crashes) > MAX_UNRESOLVED_CRASHES:
-                    self._unresolved_crashes.pop(next(iter(self._unresolved_crashes)))
+                    # Evict the NEWEST pending crash: in a crash loop the
+                    # first crash is the root cause and the tail repeats it.
+                    self._unresolved_crashes.popitem()
             self._drain_symbolizations()
 
     def _drain_symbolizations(self) -> None:
@@ -565,7 +584,9 @@ class CaptureLoop:
                 if self._active_elf is None or not self._unresolved_crashes:
                     self._decode_slots.release()
                     return
-                _, (generation, report, path) = self._unresolved_crashes.popitem()
+                # Decode oldest-first, matching the eviction policy above.
+                oldest = next(iter(self._unresolved_crashes))
+                generation, report, path = self._unresolved_crashes.pop(oldest)
                 if generation != self._active_elf_generation:
                     self._decode_slots.release()
                     continue

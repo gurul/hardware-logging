@@ -30,6 +30,7 @@ from .session import (
     base_dir,
     configured_storage_limits,
     ensure_private_dir,
+    port_match_key,
     port_slug,
     read_meta,
     release_global_bytes_locked,
@@ -161,11 +162,15 @@ def _select_target_daemon(states: list[dict], port_spec: str | None) -> dict | N
         return states[0]
 
     exact = [state for state in states if state.get("port") == port_spec]
+    # Fragments compare against hashless normalized forms (same rule as
+    # daemon.find_daemon); port_slug values are hash-suffixed and only ever
+    # equal for identical inputs, which `exact` already covers.
+    match_frag = port_match_key(port_spec)
     logical = exact or [
         state
         for state in states
         if port_spec in str(state.get("port", ""))
-        or port_slug(port_spec) == port_slug(str(state.get("port", "")))
+        or (match_frag and match_frag in port_match_key(str(state.get("port", ""))))
     ]
     try:
         board = ports.resolve_port(port_spec)
@@ -347,12 +352,18 @@ def _affected_daemons(
             invalidated.append(candidate)
             continue
         selector = str(candidate.get("port", ""))
+        # Normalized bidirectional containment: "usb0" aliases "/dev/ttyUSB0"
+        # in either direction, and raw "2" no longer aliases "ttyUSB20" only
+        # by accident of substring position.
+        spec_key = port_match_key(port_spec) if port_spec is not None else ""
+        selector_key = port_match_key(selector)
         logical_alias = (
             selector == target_selector
             or selector == "auto"
             or (
-                port_spec is not None
-                and (port_spec in selector or (selector and selector in port_spec))
+                bool(spec_key)
+                and bool(selector_key)
+                and (spec_key in selector_key or selector_key in spec_key)
             )
         )
         if logical_alias and not _meta_has_identity(candidate_meta):
@@ -360,12 +371,11 @@ def _affected_daemons(
     return invalidated, confirmed
 
 
-def _flash_lock_selector(port_spec: str | None, target: dict | None) -> str:
-    # USB identity can gain or lose serial/topology fields across bootloader
-    # transitions. A single global lease avoids splitting the lock namespace
-    # and is intentionally conservative: flashing is rare, and correctness is
-    # more important than parallel programming of independent boards.
-    return "all-hwlog-flashers"
+# USB identity can gain or lose serial/topology fields across bootloader
+# transitions. A single global lease avoids splitting the lock namespace
+# and is intentionally conservative: flashing is rare, and correctness is
+# more important than parallel programming of independent boards.
+FLASH_LEASE_NAME = "all-hwlog-flashers"
 
 
 def archive_elf(elf: Path, *, expected_digest: str | None = None) -> Path:
@@ -386,7 +396,7 @@ def archive_elf(elf: Path, *, expected_digest: str | None = None) -> Path:
                 digest_builder.update(chunk)
             full_digest = digest_builder.hexdigest()
             if expected_digest is not None and full_digest != expected_digest:
-                raise OSError("ELF changed after it was selected")
+                raise ValueError("ELF changed after it was selected")
             digest = full_digest[:12]
             stamp = time.strftime("%Y%m%d-%H%M%S")
             safe_stem = port_slug(elf.stem)[:80]
@@ -566,9 +576,8 @@ def run_flash(command: list[str], port_spec: str | None = None, cwd: Path | None
     states = daemon.list_daemons()
     state = _select_target_daemon(states, port_spec)
     code: int
-    selector = _flash_lock_selector(port_spec, state)
 
-    with _exclusive_flash_lease(selector):
+    with _exclusive_flash_lease(FLASH_LEASE_NAME):
         before_elfs = _snapshot_elfs(root)
         affected_states, association_states = _affected_daemons(states, state, port_spec)
         with ExitStack() as pause_stack:
@@ -676,7 +685,10 @@ def run_flash(command: list[str], port_spec: str | None = None, cwd: Path | None
                         f"warning: flash succeeded but ELF archival/association failed: {exc}",
                         file=sys.stderr,
                     )
-            else:
+            elif state or affected_states:
+                # Only worth a warning when a daemon's symbolization is left
+                # stale — a plain .bin flash with no daemon running has no
+                # association to miss.
                 print(
                     "warning: flash succeeded but no single unambiguous ELF candidate was found; "
                     "the new firmware remains unassociated for symbolization",

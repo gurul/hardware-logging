@@ -590,8 +590,7 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
         if server is not None:
             server.close()
         if loop is not None:
-            loop._decoder.shutdown(wait=False, cancel_futures=True)
-            loop._release_device_ownership()
+            loop.dispose()
         if writer is not None:
             writer.close()
         with contextlib.suppress(OSError):
@@ -860,6 +859,16 @@ def start_background(port_spec: str | None, baud: int) -> dict:
     if port_spec is not None and any(state.get("port") == "auto" for state in running):
         raise DaemonError(
             "an auto-select daemon is already running; stop it before starting an explicit port"
+        )
+    if port_spec is None and any(
+        state.get("port") != "auto" and state.get("legacy") is not True for state in running
+    ):
+        # The symmetric guard: an auto request must not silently adopt an
+        # arbitrary explicit-port daemon as "already running" — the attached
+        # board may not be the one that daemon is pinned to.
+        raise DaemonError(
+            "an explicit-port daemon is already running; name its port or stop it "
+            "before starting auto-select capture"
         )
     existing = find_daemon(port_spec)
     if existing:

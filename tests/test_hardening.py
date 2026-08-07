@@ -514,6 +514,22 @@ def test_session_writer_rejects_unpersistable_storage_limit(monkeypatch) -> None
         SessionWriter(_meta())
 
 
+def test_quota_dropped_crash_returns_no_path_and_is_not_counted(monkeypatch) -> None:
+    monkeypatch.setenv("HWLOG_MAX_TOTAL_BYTES", str(10 * 1024 * 1024))
+    writer = SessionWriter(_meta())
+    try:
+        monkeypatch.setattr(writer, "_reserve_storage_unlocked", lambda *_a, **_k: "global_limit")
+        before = writer.meta.crashes
+
+        assert writer.write_crash(CrashReport(1, "panic", ["panic"], [])) is None
+        # The artifact was never written: no phantom path, no crash count,
+        # but the drop itself is recorded.
+        assert writer.meta.crashes == before
+        assert writer.meta.dropped_crashes == 1
+    finally:
+        writer.close()
+
+
 def test_hot_path_writes_do_not_take_the_quota_lock_per_write(monkeypatch) -> None:
     monkeypatch.setenv("HWLOG_MAX_TOTAL_BYTES", str(64 * 1024 * 1024))
     writer = SessionWriter(_meta())
