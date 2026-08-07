@@ -35,6 +35,7 @@ from .session import (
     atomic_write_text,
     base_dir,
     ensure_private_dir,
+    port_match_key,
     port_slug,
     sessions_dir,
 )
@@ -495,10 +496,14 @@ def find_daemon(port_spec: str | None = None) -> dict | None:
     if not daemons:
         return None
     if port_spec:
-        slug_frag = port_slug(port_spec)
+        # port_slug appends a per-string hash, so slug containment can never
+        # match; compare hashless normalized forms for fragment selectors.
+        match_frag = port_match_key(port_spec)
         exact = [d for d in daemons if d["port"] == port_spec]
         matches = exact or [
-            d for d in daemons if port_spec in d["port"] or slug_frag in port_slug(d["port"])
+            d
+            for d in daemons
+            if port_spec in d["port"] or (match_frag and match_frag in port_match_key(d["port"]))
         ]
         if len(matches) > 1:
             raise AmbiguousDaemonError(
@@ -606,8 +611,14 @@ def run_daemon(port_spec: str | None, baud: int, board_meta: dict | None = None)
                 except Exception:
                     resp = {"ok": False, "error": "internal control error"}
                 payload = (json.dumps(resp) + "\n").encode()
+                if len(payload) > MAX_CONTROL_BYTES:
+                    # Substitute a valid error object; a byte-truncated reply
+                    # would be malformed JSON at the client.
+                    payload = (
+                        json.dumps({"ok": False, "error": "response too large"}) + "\n"
+                    ).encode()
                 with contextlib.suppress(OSError):
-                    conn.sendall(payload[:MAX_CONTROL_BYTES])
+                    conn.sendall(payload)
 
         def dispatch(req: dict) -> dict:
             nonlocal pause_lease, pause_owner_pid

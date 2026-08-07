@@ -161,7 +161,8 @@ def iter_records(session: Path, *, max_bytes: int | None = None) -> Iterator[Log
                         if chunk.endswith(b"\n"):
                             break
         while f.tell() < end and (line := f.readline(min(MAX_JSON_LINE_BYTES + 1, end - f.tell()))):
-            oversized = len(line) > MAX_JSON_LINE_BYTES
+            newline_len = 1 if line.endswith(b"\n") else 0
+            oversized = len(line) - newline_len > MAX_JSON_LINE_BYTES
             if oversized and not line.endswith(b"\n"):
                 while f.tell() < end and line and not line.endswith(b"\n"):
                     line = f.readline(min(MAX_JSON_LINE_BYTES + 1, end - f.tell()))
@@ -466,12 +467,13 @@ def wait_for_record(
     )
     deadline = time.monotonic() + timeout
     while True:
+        # Finish the drained batch before honoring the deadline: a match
+        # already read from disk must not be discarded by a mid-batch timeout.
+        # Each read() is byte-bounded, so the overrun is bounded too.
         records = follower.read()
         for record in records:
             if pattern_matches(compiled, record.msg):
                 return record
-            if time.monotonic() >= deadline:
-                return None
         if time.monotonic() >= deadline:
             return None
         # Drain a busy file without adding avoidable latency; otherwise poll.

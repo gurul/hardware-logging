@@ -128,6 +128,22 @@ def test_decode_kills_infinite_output_at_pipe_ceiling(
     assert time.monotonic() - started < 0.75
 
 
+def test_decode_keeps_bounded_prefix_when_stdout_overflows(tmp_path, monkeypatch):
+    tool = _fake_addr2line(
+        tmp_path,
+        "import os\nchunk = b'frame line\\n' * 64\nwhile True:\n    os.write(1, chunk)\n",
+    )
+    monkeypatch.setattr(crash_mod, "MAX_ADDR2LINE_STDOUT_BYTES", 4096)
+    monkeypatch.setattr(crash_mod, "ADDR2LINE_TIMEOUT_S", 1.0)
+
+    frames = decode_backtrace(["0x400d1234"], "firmware.elf", str(tool))
+
+    # A deep but legitimate backtrace keeps its bounded prefix instead of
+    # losing the whole decode, and a mid-line cut never yields a torn frame.
+    assert frames
+    assert all(frame == "frame line" for frame in frames)
+
+
 def test_decode_enforces_wall_clock_deadline(tmp_path, monkeypatch):
     tool = _fake_addr2line(
         tmp_path,

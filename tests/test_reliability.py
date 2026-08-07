@@ -446,12 +446,12 @@ def test_reconnect_retains_location_lock_when_usb_serial_appears(monkeypatch):
 
     try:
         assert loop._open_port() is True
-        original_lock_key = loop._device_lock_key
+        original_lock_keys = sorted(loop._device_locks)
         loop._close_port("metadata upgraded")
 
         assert loop._open_port() is True
         assert opened == [first.device, upgraded.device]
-        assert loop._device_lock_key == original_lock_key
+        assert sorted(loop._device_locks) == original_lock_keys
         assert loop._usb_location == location
         assert loop._usb_serial is None
         assert writer.meta.usb_location == location

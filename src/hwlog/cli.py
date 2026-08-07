@@ -343,7 +343,7 @@ def crashes(
                         "backtrace_count": len(r.get("backtrace_addrs", [])),
                         "decoded": bool(r.get("decoded_frames")),
                     },
-                    ensure_ascii=False,
+                    ensure_ascii=True,
                 )
             )
             continue

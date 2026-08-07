@@ -173,6 +173,10 @@ def _bounded_addr2line_stdout(command: list[str]) -> bytes | None:
     Pipes are consumed with nonblocking POSIX selectors instead of
     ``communicate()`` so a descendant that inherits stdout/stderr cannot keep the
     caller blocked after the direct child exits.
+
+    Output beyond the byte caps is truncated rather than discarded: a deep but
+    legitimate backtrace keeps its bounded prefix. Only a timeout or spawn
+    failure returns ``None``.
     """
     try:
         process = subprocess.Popen(
@@ -196,6 +200,7 @@ def _bounded_addr2line_stdout(command: list[str]) -> bytes | None:
     }
     deadline = time.monotonic() + ADDR2LINE_TIMEOUT_S
     failed = False
+    truncated = False
 
     try:
         for name, stream in zip(("stdout", "stderr"), streams, strict=True):
@@ -218,7 +223,7 @@ def _bounded_addr2line_stdout(command: list[str]) -> bytes | None:
                     if not ready:
                         break
                     if _consume_addr2line_events(selector, ready, buffers, limits):
-                        failed = True
+                        truncated = True
                         break
                 break
 
@@ -229,7 +234,7 @@ def _bounded_addr2line_stdout(command: list[str]) -> bytes | None:
                     time.sleep(timeout)
                 continue
             if _consume_addr2line_events(selector, ready, buffers, limits):
-                failed = True
+                truncated = True
                 break
     except OSError:
         failed = True
@@ -245,7 +250,13 @@ def _bounded_addr2line_stdout(command: list[str]) -> bytes | None:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=ADDR2LINE_REAP_GRACE_S)
 
-    return None if failed else bytes(buffers["stdout"])
+    if failed:
+        return None
+    stdout = bytes(buffers["stdout"])
+    if truncated:
+        # Keep whole frames only; a mid-line cut would yield a garbage frame.
+        stdout = stdout[: stdout.rfind(b"\n") + 1]
+    return stdout
 
 
 def _consume_addr2line_events(

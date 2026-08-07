@@ -387,6 +387,21 @@ def test_find_daemon_requires_an_unambiguous_selector(monkeypatch):
     assert daemon.find_daemon("not-present") is None
 
 
+def test_find_daemon_matches_case_insensitive_normalized_fragments(monkeypatch):
+    first = {"port": "/dev/ttyUSB2"}
+    second = {"port": "/dev/ttyUSB20"}
+    monkeypatch.setattr(daemon, "list_daemons", lambda: [first, second])
+
+    # Fragments compare against hashless normalized forms, case-insensitively.
+    assert daemon.find_daemon("usb20") is second
+    assert daemon.find_daemon("ttyusb20") is second
+    # An exact port wins outright even when it is a prefix of another port.
+    assert daemon.find_daemon("/dev/ttyUSB2") is first
+    with pytest.raises(daemon.AmbiguousDaemonError, match="matches multiple daemons"):
+        daemon.find_daemon("usb2")
+    assert daemon.find_daemon("usb9") is None
+
+
 def test_direct_daemon_entry_refuses_an_overlapping_auto_owner(running_daemon):
     _state, _state_file, _thread = running_daemon
 

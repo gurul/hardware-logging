@@ -111,9 +111,7 @@ class CaptureLoop:
         self._active_elf_generation = (
             writer.meta.elf_generation if self._active_elf is not None else None
         )
-        self._device_lock = None
         self._device_locks: dict[str, object] = {}
-        self._device_lock_key: str | None = None
 
     # -- public control (called from daemon/control thread) -----------------
 
@@ -456,14 +454,10 @@ class CaptureLoop:
                     lock.close()
             return False
         self._device_locks = acquired
-        self._device_lock = next(iter(acquired.values()))
-        self._device_lock_key = ",".join(acquired)
         return True
 
     def _release_device_ownership(self) -> None:
         locks, self._device_locks = self._device_locks, {}
-        self._device_lock = None
-        self._device_lock_key = None
         for lock in locks.values():
             with contextlib.suppress(OSError):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
