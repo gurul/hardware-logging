@@ -153,8 +153,13 @@ def sessions_dir() -> Path:
     return base_dir() / "sessions"
 
 
+def port_match_key(port: str) -> str:
+    """Normalized, hashless form of a port name, for selector matching."""
+    return re.sub(r"[^A-Za-z0-9]+", "-", port).strip("-").lower()
+
+
 def port_slug(port: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", port).strip("-").lower()
+    slug = port_match_key(port)
     digest = hashlib.sha256(port.encode("utf-8", "replace")).hexdigest()[:12]
     if not slug:
         return f"unknown-{digest}"

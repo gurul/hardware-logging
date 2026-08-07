@@ -239,6 +239,21 @@ def test_combined_counted_repeats_are_rejected_before_compilation() -> None:
         compile_pattern(r"(?x:a{500}# ignored parenthesis (" + "\n){500}")
 
 
+def test_nested_counted_repeats_are_rejected_before_compilation() -> None:
+    with pytest.raises(PatternError, match="complexity"):
+        compile_pattern(r"(a{500}){500}")
+
+
+def test_sequential_counted_repeats_are_not_multiplied() -> None:
+    # Sequential repeats add match work; only nesting multiplies expansion.
+    compile_pattern(r"a{100}b{200}")
+    compile_pattern(r"[0-9]{50}[a-f]{50}x{50}")
+
+
+def test_braces_inside_character_classes_are_literals() -> None:
+    compile_pattern(r"[a{1500}]")
+
+
 def test_crash_artifacts_sort_by_numeric_id_and_latest_skips_invalid(tmp_path: Path) -> None:
     session = tmp_path / "session"
     crash_dir = session / "crashes"
