@@ -8,9 +8,8 @@ returns 0 on pattern match, 1 on timeout) so agents and CI can branch on them.
 from __future__ import annotations
 
 import json
-import re
 import sys
-import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -19,7 +18,9 @@ from . import __version__, daemon, query
 from . import flash as flash_mod
 from . import ports as ports_mod
 from .capture import CaptureLoop
+from .parsers import strip_ansi
 from .records import SessionMeta, now_iso
+from .safety import MAX_WAIT_SECONDS, PatternError
 from .session import SessionWriter, list_sessions, read_meta, resolve_session
 
 app = typer.Typer(
@@ -28,6 +29,10 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+MAX_CLI_CRASH_ROWS = 500
+MAX_CLI_SUMMARY_CHARS = 512
+MAX_CLI_BOOT_ROWS = 500
 
 
 def _fail(msg: str, code: int = 2) -> None:
@@ -40,6 +45,25 @@ def _session_or_fail(session: str | None) -> Path:
     if s is None:
         _fail("no capture session found — start one with `hwlog start` or `hwlog monitor`")
     return s
+
+
+def _scan_budget(value: int | None) -> int:
+    try:
+        budget = query.configured_cli_scan_bytes() if value is None else value
+    except ValueError as exc:
+        _fail(str(exc))
+    if budget < 0:
+        _fail("scan bytes must be non-negative")
+    return budget
+
+
+def _warn_truncated_scan(session: Path, budget: int) -> None:
+    if query.record_scan_is_truncated(session, budget):
+        typer.echo(
+            f"warning: scanned only the newest {budget} bytes; older matches were omitted "
+            "(adjust --scan-bytes or HWLOG_QUERY_SCAN_BYTES)",
+            err=True,
+        )
 
 
 @app.command()
@@ -61,8 +85,8 @@ def ports_cmd(json_out: bool = typer.Option(False, "--json", help="NDJSON output
         return
     for b in boards:
         marker = "●" if b.is_known else " "
-        hint = f"  [{b.hint}]" if b.hint else ""
-        typer.echo(f"{marker} {b.device}  {b.description}{hint}")
+        hint = f"  [{strip_ansi(b.hint)}]" if b.hint else ""
+        typer.echo(f"{marker} {strip_ansi(b.device)}  {strip_ansi(b.description)}{hint}")
 
 
 @app.command()
@@ -71,7 +95,12 @@ def monitor(
     baud: int = typer.Option(115200, "--baud", "-b"),
 ) -> None:
     """Foreground capture: live view + full session recording. Ctrl-C to stop."""
-    board = ports_mod.resolve_port(port)
+    if baud <= 0:
+        _fail("baud must be positive")
+    try:
+        board = ports_mod.resolve_port(port)
+    except ports_mod.AmbiguousPortError as exc:
+        _fail(str(exc))
     meta = SessionMeta(
         session_id="",
         port=port or (board.device if board else "auto"),
@@ -79,6 +108,8 @@ def monitor(
         started_at=now_iso(),
         usb_vid=board.vid if board else None,
         usb_pid=board.pid if board else None,
+        usb_serial=board.serial_number if board else None,
+        usb_location=board.location if board else None,
         board_hint=board.hint if board else None,
     )
     writer = SessionWriter(meta)
@@ -101,16 +132,30 @@ def start(
     baud: int = typer.Option(115200, "--baud", "-b"),
 ) -> None:
     """Start the background capture daemon (single owner of the port)."""
-    state = daemon.start_background(port, baud)
+    if baud <= 0:
+        _fail("baud must be positive")
+    try:
+        state = daemon.start_background(port, baud)
+    except (daemon.DaemonError, ValueError, RuntimeError) as exc:
+        _fail(str(exc), code=1)
     typer.echo(f"daemon pid {state['pid']} on {state['port']} → {state['session']}")
 
 
 @app.command()
 def stop(port: str | None = typer.Option(None, "--port", "-p")) -> None:
     """Stop the background capture daemon."""
-    state = daemon.find_daemon(port)
+    try:
+        state = daemon.find_daemon(port)
+    except daemon.AmbiguousDaemonError as exc:
+        _fail(str(exc))
     if not state:
         _fail("no running daemon")
+    if state.get("legacy") is True:
+        _fail(
+            "legacy daemon control is unauthenticated; stop it with the previously installed "
+            "hwlog version, or verify and terminate its recorded PID, then retry",
+            code=1,
+        )
     ok = daemon.stop_daemon(state)
     typer.echo("stopped" if ok else "daemon did not exit cleanly", err=not ok)
     raise typer.Exit(0 if ok else 1)
@@ -126,18 +171,44 @@ def status(json_out: bool = typer.Option(False, "--json")) -> None:
     for state in daemons:
         try:
             resp = daemon.send_cmd(state, {"cmd": "status"})
-        except OSError as e:
+        except (OSError, daemon.DaemonError) as e:
             resp = {"ok": False, "error": str(e)}
-        info = {**state, **resp}
+        public_state = {key: value for key, value in state.items() if key != "instance"}
+        info = {**public_state, **resp}
+        try:
+            meta = read_meta(Path(state["session"]))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            meta = None
+        if meta is not None:
+            info.update(
+                {
+                    "storage_capped": meta.storage_capped,
+                    "storage_cap_reason": meta.storage_cap_reason,
+                    "storage_limit_bytes": meta.storage_limit_bytes,
+                    "dropped_raw_bytes": meta.dropped_raw_bytes,
+                    "dropped_records": meta.dropped_records,
+                    "dropped_crashes": meta.dropped_crashes,
+                }
+            )
         if json_out:
             typer.echo(json.dumps(info))
         else:
             conn = "connected" if resp.get("connected") else "disconnected"
             paused = " (paused)" if resp.get("paused") else ""
+            storage = ""
+            if meta is not None:
+                storage = f"\n  storage limit={meta.storage_limit_bytes}B"
+                if meta.storage_capped:
+                    storage += (
+                        f" capped ({meta.storage_cap_reason}); "
+                        f"dropped raw={meta.dropped_raw_bytes}B records={meta.dropped_records} "
+                        f"crashes={meta.dropped_crashes}"
+                    )
             typer.echo(
-                f"pid {state['pid']}  {state['port']}  {conn}{paused}  "
+                f"pid {state['pid']}  {strip_ansi(str(state['port']))}  {conn}{paused}  "
                 f"boots={resp.get('boots')} crashes={resp.get('crashes')} "
-                f"records={resp.get('records')}\n  session: {state['session']}"
+                f"records={resp.get('records')}\n  session: {strip_ansi(str(state['session']))}"
+                f"{storage}"
             )
 
 
@@ -152,30 +223,70 @@ def logs(
     session: str | None = typer.Option(None, "--session", "-s"),
     no_collapse: bool = typer.Option(False, "--no-collapse", help="Keep repeated lines"),
     json_out: bool = typer.Option(False, "--json", help="NDJSON records"),
+    scan_bytes: int | None = typer.Option(
+        None,
+        "--scan-bytes",
+        help="Newest log bytes to inspect (default: HWLOG_QUERY_SCAN_BYTES or 64 MiB)",
+    ),
 ) -> None:
     """Query captured logs (bounded — safe to call from an agent loop)."""
+    if tail < 0:
+        _fail("tail must be non-negative")
+    if level is not None and level.upper() not in query.LEVEL_ORDER:
+        _fail("level must be one of E, W, I, D, V")
+    if since is not None:
+        try:
+            parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if parsed_since.tzinfo is None:
+                raise ValueError
+            since = (
+                parsed_since.astimezone(UTC)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+        except ValueError:
+            _fail("since must be a timezone-aware ISO-8601 timestamp")
     s = _session_or_fail(session)
-    b = query.latest_boot(s) if boot == -1 else boot
+    budget = _scan_budget(scan_bytes)
+    b = query.latest_boot(s, max_bytes=budget) if boot == -1 else boot
     recs = query.filter_records(
-        query.iter_records(s), boot=b, level=level, grep=grep, tag=tag, since=since
+        query.iter_records(s, max_bytes=budget),
+        boot=b,
+        level=level,
+        grep=grep,
+        tag=tag,
+        since=since,
     )
     if not no_collapse:
         recs = query.collapse_repeats(recs)
     out = query.tail(recs, tail)
     for r in out:
-        typer.echo(r.to_json() if json_out else query.format_record(r))
+        typer.echo(r.to_json(ensure_ascii=True) if json_out else query.format_record(r))
     if not out:
         typer.echo("(no matching records)", err=True)
+    _warn_truncated_scan(s, budget)
 
 
 @app.command()
 def boots(
     session: str | None = typer.Option(None, "--session", "-s"),
     json_out: bool = typer.Option(False, "--json"),
+    scan_bytes: int | None = typer.Option(
+        None,
+        "--scan-bytes",
+        help="Newest log bytes to inspect (default: HWLOG_QUERY_SCAN_BYTES or 64 MiB)",
+    ),
 ) -> None:
     """List boot cycles: when the device reset, and how each boot went."""
     s = _session_or_fail(session)
-    rows = query.list_boots(s)
+    budget = _scan_budget(scan_bytes)
+    rows = query.list_boots(s, max_bytes=budget)
+    if len(rows) > MAX_CLI_BOOT_ROWS:
+        typer.echo(
+            f"warning: showing only the newest {MAX_CLI_BOOT_ROWS} boot rows",
+            err=True,
+        )
+        rows = rows[-MAX_CLI_BOOT_ROWS:]
     for row in rows:
         if json_out:
             typer.echo(json.dumps(row))
@@ -186,6 +297,7 @@ def boots(
             )
     if not rows:
         typer.echo("(no records)", err=True)
+    _warn_truncated_scan(s, budget)
 
 
 @app.command()
@@ -196,21 +308,20 @@ def crashes(
 ) -> None:
     """List crash reports; --last prints the full decoded artifact."""
     s = _session_or_fail(session)
-    reports = query.list_crashes(s)
-    if not reports:
-        typer.echo("(no crashes recorded)", err=True)
-        return
     if last:
-        r = reports[-1]
-        if json_out:
-            typer.echo(json.dumps(r, indent=2))
+        r = query.get_crash(s)
+        if r is None:
+            typer.echo("(no crashes recorded)", err=True)
             return
-        typer.echo(f"crash {r['crash_id']}: {r['first_line']}")
+        if json_out:
+            typer.echo(json.dumps(r, ensure_ascii=True))
+            return
+        typer.echo(f"crash {r['crash_id']}: {strip_ansi(str(r['first_line']))}")
         typer.echo("--- raw ---")
-        typer.echo("\n".join(r["lines"]))
+        typer.echo("\n".join(strip_ansi(str(line)) for line in r["lines"]))
         if r.get("decoded_frames"):
             typer.echo("--- decoded backtrace ---")
-            typer.echo("\n".join(r["decoded_frames"]))
+            typer.echo("\n".join(strip_ansi(str(line)) for line in r["decoded_frames"]))
         elif r.get("backtrace_addrs"):
             typer.echo(
                 "--- backtrace not decoded (no archived ELF or addr2line; "
@@ -218,8 +329,25 @@ def crashes(
             )
             typer.echo(" ".join(r["backtrace_addrs"]))
         return
+    reports = query.list_crashes(s, limit=MAX_CLI_CRASH_ROWS)
+    if not reports:
+        typer.echo("(no crashes recorded)", err=True)
+        return
     for r in reports:
-        summary = f"{r['first_line']}"
+        if json_out:
+            typer.echo(
+                json.dumps(
+                    {
+                        "crash_id": r["crash_id"],
+                        "first_line": strip_ansi(str(r["first_line"]))[:MAX_CLI_SUMMARY_CHARS],
+                        "backtrace_count": len(r.get("backtrace_addrs", [])),
+                        "decoded": bool(r.get("decoded_frames")),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            continue
+        summary = strip_ansi(str(r["first_line"]))[:MAX_CLI_SUMMARY_CHARS]
         decoded = " [decoded]" if r.get("decoded_frames") else ""
         typer.echo(f"{r['crash_id']:>3}  {summary}{decoded}")
 
@@ -231,10 +359,16 @@ def send(
     no_newline: bool = typer.Option(False, "--no-newline"),
 ) -> None:
     """Send a line to the device through the daemon (stimulus injection)."""
-    state = daemon.find_daemon(port)
+    try:
+        state = daemon.find_daemon(port)
+    except daemon.AmbiguousDaemonError as exc:
+        _fail(str(exc))
     if not state:
         _fail("no running daemon — start one with `hwlog start`")
-    resp = daemon.send_cmd(state, {"cmd": "send", "data": text, "newline": not no_newline})
+    try:
+        resp = daemon.send_cmd(state, {"cmd": "send", "data": text, "newline": not no_newline})
+    except (OSError, daemon.DaemonError) as exc:
+        _fail(str(exc), code=1)
     if not resp.get("ok"):
         _fail(resp.get("error") or "send failed", code=1)
     typer.echo("sent")
@@ -255,32 +389,19 @@ def wait(
     is not "it works" — gate your loop on observed behavior.
     """
     s = _session_or_fail(session)
-    rx = re.compile(pattern)
-    log_path = s / "log.jsonl"
-    offset = 0 if from_start else (log_path.stat().st_size if log_path.exists() else 0)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if log_path.exists():
-            with log_path.open(encoding="utf-8") as f:
-                f.seek(offset)
-                chunk = f.read()
-                offset = f.tell()
-            for line in chunk.splitlines():
-                try:
-                    rec = query.LogRecord.from_json(line)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if rx.search(rec.msg):
-                    typer.echo(query.format_record(rec))
-                    raise typer.Exit(0)
-        time.sleep(0.2)
-    typer.echo(f"timeout after {timeout}s waiting for /{pattern}/", err=True)
+    try:
+        rec = query.wait_for_record(s, pattern, timeout, from_start=from_start)
+    except (PatternError, ValueError) as exc:
+        _fail(str(exc))
+    if rec is not None:
+        typer.echo(query.format_record(rec))
+        raise typer.Exit(0)
+    bounded = min(timeout, MAX_WAIT_SECONDS)
+    typer.echo(f"timeout after {bounded}s waiting for /{strip_ansi(pattern)}/", err=True)
     raise typer.Exit(1)
 
 
-@app.command(
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
-)
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def flash(
     ctx: typer.Context,
     port: str | None = typer.Option(None, "--port", "-p"),
@@ -292,7 +413,10 @@ def flash(
     """
     if not ctx.args:
         _fail("usage: hwlog flash -- <flash command>")
-    code = flash_mod.run_flash(list(ctx.args), port_spec=port)
+    try:
+        code = flash_mod.run_flash(list(ctx.args), port_spec=port)
+    except (OSError, ValueError, daemon.DaemonError) as exc:
+        _fail(str(exc), code=1)
     raise typer.Exit(code)
 
 
@@ -304,13 +428,24 @@ def sessions(json_out: bool = typer.Option(False, "--json")) -> None:
         typer.echo("(no sessions)", err=True)
         return
     for p in found:
-        meta = read_meta(p)
+        try:
+            meta = read_meta(p)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            typer.echo(f"warning: skipping corrupt session metadata: {p.name}", err=True)
+            continue
         if json_out:
             typer.echo(meta.to_json().replace("\n", " "))
         else:
+            storage = ""
+            if meta.storage_capped:
+                storage = (
+                    f"  [storage capped: {meta.storage_cap_reason}; "
+                    f"dropped {meta.dropped_raw_bytes}B/{meta.dropped_records} records/"
+                    f"{meta.dropped_crashes} crashes]"
+                )
             typer.echo(
-                f"{meta.session_id}  port={meta.port} boots={meta.boots} "
-                f"crashes={meta.crashes}{'' if meta.ended_at else '  (active)'}"
+                f"{strip_ansi(meta.session_id)}  port={strip_ansi(meta.port)} boots={meta.boots} "
+                f"crashes={meta.crashes}{'' if meta.ended_at else '  (active)'}{storage}"
             )
 
 

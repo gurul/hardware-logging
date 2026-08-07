@@ -51,9 +51,7 @@ def test_capture_records_parses_and_segments(monkeypatch):
     ser.write(b"E (5) init: bad config\n")
 
     session = resolve_session()
-    assert wait_for(
-        lambda: any(r.msg == "bad config" for r in query.iter_records(session))
-    )
+    assert wait_for(lambda: any(r.msg == "bad config" for r in query.iter_records(session)))
     cap.stop()
     thread.join(timeout=5)
 
@@ -86,9 +84,7 @@ def test_send_writes_to_device_and_records(monkeypatch):
     assert cap.send(b"button:press\n")
     session = resolve_session()
     # loopback: the sent bytes come back as device output too
-    assert wait_for(
-        lambda: any(r.event == "sent" for r in query.iter_records(session))
-    )
+    assert wait_for(lambda: any(r.event == "sent" for r in query.iter_records(session)))
     cap.stop()
     thread.join(timeout=5)
 
@@ -106,3 +102,25 @@ def test_pause_releases_port_and_resume_reopens(monkeypatch):
     assert monkeypatch_factory_called
     cap.stop()
     thread.join(timeout=5)
+
+
+def test_capture_survives_oversized_device_timestamp(monkeypatch):
+    ser, cap, thread = start_loop(monkeypatch)
+    hostile = "I (" + "9" * 5000 + ") app: hostile"
+    session = resolve_session()
+    try:
+        ser.write(hostile.encode() + b"\n")
+        ser.write(b"I (2) app: capture continued\n")
+
+        assert wait_for(
+            lambda: any(record.msg == "capture continued" for record in query.iter_records(session))
+        )
+        assert thread.is_alive()
+    finally:
+        cap.stop()
+        thread.join(timeout=5)
+
+    records = list(query.iter_records(session))
+    fallback = next(record for record in records if record.msg == hostile)
+    assert fallback.level is None
+    assert fallback.dev_ts is None

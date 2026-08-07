@@ -21,7 +21,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -33,6 +34,7 @@ dependencies = [
     "pyserial>=3.5",
     "typer>=0.19",
     "fastmcp>=3.0",
+    "regex>=2024.11.6",
 ]
 
 [project.urls]
@@ -45,12 +47,13 @@ hwlog = "hwlog.cli:app"
 
 [dependency-groups]
 dev = [
+    "hatchling==1.31.0",
     "pytest>=8.0",
     "ruff>=0.8",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

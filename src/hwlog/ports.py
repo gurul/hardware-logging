@@ -27,6 +27,10 @@ VID_HINTS: dict[int, str] = {
 }
 
 
+class AmbiguousPortError(ValueError):
+    """A selector matches more than one live serial device."""
+
+
 @dataclass
 class Board:
     device: str
@@ -35,6 +39,7 @@ class Board:
     pid: int | None
     serial_number: str | None
     hint: str | None
+    location: str | None = None
 
     @property
     def is_known(self) -> bool:
@@ -58,6 +63,7 @@ def discover() -> list[Board]:
                 pid=p.pid,
                 serial_number=p.serial_number,
                 hint=hint,
+                location=p.location,
             )
         )
     boards.sort(key=lambda b: (not b.is_known, b.device))
@@ -78,9 +84,20 @@ def resolve_port(spec: str | None = None) -> Board | None:
                 return b
         matches = [b for b in boards if spec in b.device]
         matches.sort(key=lambda b: not b.is_known)
+        if len(matches) > 1:
+            devices = ", ".join(board.device for board in matches)
+            raise AmbiguousPortError(f"port selector {spec!r} is ambiguous: {devices}")
         return matches[0] if matches else None
     known = [b for b in boards if b.is_known]
-    if known:
+    if len(known) == 1:
         return known[0]
+    if len(known) > 1:
+        devices = ", ".join(board.device for board in known)
+        raise AmbiguousPortError(f"multiple development boards found; specify --port: {devices}")
     usb = [b for b in boards if "usb" in b.device.lower()]
-    return usb[0] if usb else None
+    if len(usb) == 1:
+        return usb[0]
+    if len(usb) > 1:
+        devices = ", ".join(board.device for board in usb)
+        raise AmbiguousPortError(f"multiple USB serial ports found; specify --port: {devices}")
+    return boards[0] if len(boards) == 1 else None
