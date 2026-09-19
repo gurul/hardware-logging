@@ -14,6 +14,7 @@ import stat
 import time
 from collections import deque
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from .crash import MAX_CRASH_ARTIFACT_BYTES, MAX_CRASH_CONTENT_CHARS
@@ -139,13 +140,32 @@ def _validate_crash_report(value: object) -> dict | None:
     }
 
 
-def iter_records(session: Path, *, max_bytes: int | None = None) -> Iterator[LogRecord]:
+@dataclass
+class ScanStats:
+    """Evidence coverage for one log-file snapshot, including discarded data."""
+
+    available: bool = False
+    file_bytes: int = 0
+    scanned_bytes: int = 0
+    truncated: bool = False
+    skipped_records: int = 0
+    incomplete_tail: bool = False
+
+
+def iter_records(
+    session: Path, *, max_bytes: int | None = None, stats: ScanStats | None = None
+) -> Iterator[LogRecord]:
     path = session / "log.jsonl"
     f = _open_regular(path)
     if f is None:
         return
     with f:
         end = os.fstat(f.fileno()).st_size
+        if stats is not None:
+            stats.available = True
+            stats.file_bytes = end
+            stats.scanned_bytes = end if max_bytes is None else min(end, max(0, max_bytes))
+            stats.truncated = stats.scanned_bytes < end
         if max_bytes is not None:
             max_bytes = max(0, max_bytes)
             start = max(0, end - max_bytes)
@@ -160,19 +180,31 @@ def iter_records(session: Path, *, max_bytes: int | None = None) -> Iterator[Log
                     ):
                         if chunk.endswith(b"\n"):
                             break
+                        if stats is not None and f.tell() == end:
+                            stats.incomplete_tail = True
         while f.tell() < end and (line := f.readline(min(MAX_JSON_LINE_BYTES + 1, end - f.tell()))):
+            if stats is not None and not line.endswith(b"\n") and f.tell() == end:
+                stats.incomplete_tail = True
             newline_len = 1 if line.endswith(b"\n") else 0
             oversized = len(line) - newline_len > MAX_JSON_LINE_BYTES
             if oversized and not line.endswith(b"\n"):
+                if stats is not None:
+                    stats.skipped_records += 1
                 while f.tell() < end and line and not line.endswith(b"\n"):
                     line = f.readline(min(MAX_JSON_LINE_BYTES + 1, end - f.tell()))
+                if stats is not None and line and not line.endswith(b"\n"):
+                    stats.incomplete_tail = True
                 continue
             line = line.strip()
             if not line or oversized:
+                if stats is not None and oversized:
+                    stats.skipped_records += 1
                 continue
             record = _record_from_bytes(line)
             if record is not None:
                 yield record
+            elif stats is not None:
+                stats.skipped_records += 1
 
 
 def filter_records(

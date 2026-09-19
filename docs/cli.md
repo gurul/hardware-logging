@@ -1,11 +1,21 @@
 # CLI reference
 
-All query commands print compact text by default and NDJSON with `--json`. Exit codes are part of the contract.
+Query commands print compact text by default and NDJSON with `--json`; `summary --json` returns one summary object. `describe` always prints JSON. Exit codes are part of the contract.
 
 ## Capture
 
-### `hwlog ports [--json]`
+### `hwlog ports [--json] [--match TEXT] [--vid ID] [--pid ID] [--serial SERIAL]`
 List serial ports, likely dev boards first (identified by USB VID: Espressif, CP210x, CH340, FTDI, RP2040, STM32, nRF, …).
+
+Filters combine with AND. `--match` is a case-insensitive substring of the port path, description, board hint, or USB location. `--vid` and `--pid` accept decimal or `0x`-prefixed hexadecimal IDs (0–65535); `--serial` matches the exact, case-sensitive USB serial number. Discovery does not open ports. These filters narrow discovery only; use the returned port with `start --port`.
+
+```bash
+hwlog ports --vid 0x303a --json
+hwlog ports --match raspberry --serial E661410403123456
+```
+
+### `hwlog describe`
+Print the versioned JSON capability manifest shared with MCP `describe_capabilities`: observations, device-discovery filters, event names, limits, and write policy. `writes.mcp_enabled` reflects this process's environment; the MCP server must have its own `HWLOG_MCP_ALLOW_SEND=1` opt-in. CLI `send` is independent of that MCP opt-in. No capture session is required. This describes hwlog's interface, not a connected board's command vocabulary or an MHS-compatible manifest.
 
 ### `hwlog start [--port SPEC] [--baud N]`
 Start the background capture daemon. `--port` accepts an exact path or a substring (`usbmodem` survives replug renumbering, matched case-insensitively against the normalized port name); omitted, the best board candidate is auto-detected. Idempotent for the same selection — repeating it returns the existing daemon. Mixing selection modes is refused in both directions: an explicit `--port` will not start alongside a running auto-select daemon, and auto-select will not silently adopt a running explicit-port daemon.
@@ -24,6 +34,13 @@ re-validating through the daemon lock that the recorded PID is still the
 daemon's own, never a reused PID.
 
 ## Query
+
+### `hwlog summary [--session ID] [--json] [--scan-bytes N]`
+Start an investigation with compact recorded evidence. The JSON object includes device identity, firmware/ELF generations, persisted storage-loss counters, observed record/error/warning/boot-event/crash counts, the latest observed boot index, the last record, and the newest eight fault records (warnings, errors or crash events). Counts include repeats; they measure records, not unique incidents. Up to 20 distinct tags are tracked, in first-seen order within the scan and displayed by frequency; `untracked_tag_records` counts records belonging to additional tags.
+
+Both CLI and MCP scan at most the newest 16 MiB and return a JSON object within 32 KiB when serialized with ASCII escaping. CLI `--scan-bytes` can reduce the window; larger values are capped at 16 MiB and zero scans no records. This command does not use `HWLOG_QUERY_SCAN_BYTES`. `scan` reports availability, snapshot file size, byte-window size, omitted older data (`truncated`), invalid/oversized records skipped, and an incomplete final line. A record straddling the start boundary is discarded; `scanned_bytes` describes the byte window, not the size of valid parsed records. A concurrent append after the snapshot is picked up on the next query.
+
+Messages and tags are sanitized and shortened; `text_truncated` marks shortened record/tag text. `omitted_faults` counts older fault records excluded by the response limit. Select a session explicitly when using multiple devices. A missing log, a truncated scan, storage loss, or zero errors is not proof of device health. The command does not contact the daemon or open the serial port.
 
 ### `hwlog logs [options]`
 Bounded log query over the current (or `--session`) session.

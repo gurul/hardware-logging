@@ -12,6 +12,8 @@ Wiring a coding agent to a dev board fails in predictable ways: blocking monitor
 
 ## Features
 
+- **Discover before operating** — `hwlog describe` publishes a versioned capability manifest; `hwlog ports --match esp32 --vid 0x303a` narrows device discovery before MCP response limits
+- **Compact evidence summaries** — `hwlog summary` reports observed faults, firmware generation, storage loss and scan coverage before an agent requests detailed logs
 - **Persistent capture sessions** — logs are recorded to disk continuously; the crash that happened while your agent was thinking is still there
 - **Structure at ingest** — ANSI stripped; ESP-IDF and Arduino log formats parsed into `{level, tag, msg, timestamp}`
 - **Boot-cycle segmentation** — "logs since the last boot" is one flag (`--boot -1`); reboot loops are instantly visible in `hwlog boots`
@@ -35,9 +37,11 @@ Or run without installing: `uvx --from hardware-logging hwlog ports`
 
 ```bash
 hwlog ports                     # find your board
+hwlog describe                  # JSON capabilities, limits and current MCP write policy
 hwlog start                     # background capture daemon (auto-detects the board)
 hwlog flash -- idf.py flash     # flash through the wrapper (exclusive pause + ELF archive)
 hwlog wait --pattern "setup done" --timeout 20   # verify it actually booted
+hwlog summary                   # compact evidence and coverage from the recorded session
 hwlog logs --boot -1 --tail 50  # structured logs from the latest boot
 hwlog crashes --last            # full decoded crash artifact, if it crashed
 ```
@@ -54,7 +58,9 @@ Or add the MCP server (Claude Code shown):
 claude mcp add hardware-logging -- uvx --from hardware-logging hwlog mcp
 ```
 
-Agents get `query_logs`, `list_boots`, `get_crash`, `wait_for_pattern`, `send_to_device`, `capture_status`. Device telemetry is labeled untrusted, and MCP device writes are disabled unless the user sets `HWLOG_MCP_ALLOW_SEND=1`. Session data and the daemon control channel are owner-only; storage and query scans are bounded by default — see [storage limits](./docs/cli.md#storage-limits).
+Agents get `describe_capabilities`, filtered `list_serial_ports`, `summarize_session`, `query_logs`, `list_boots`, `get_crash`, `wait_for_pattern`, `send_to_device`, and `capture_status(port=...)`. Device telemetry is labeled untrusted, and MCP device writes are disabled unless the user sets `HWLOG_MCP_ALLOW_SEND=1`. Session data and the daemon control channel are owner-only; storage and query scans are bounded by default — see [storage limits](./docs/cli.md#storage-limits).
+
+The [MHS-inspired design notes](./docs/mhs-design-notes.md) explain the discovery and observation workflow. hwlog remains a serial evidence tool: it does not implement MHS, infer a device's command schema, or enforce physical safety limits.
 
 ## The agent debug loop
 

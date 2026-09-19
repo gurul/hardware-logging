@@ -7,7 +7,7 @@ The single architectural decision everything else follows from: **one daemon own
 Serial ports are single-owner resources. Every classic failure in agent-driven hardware work — blocking monitors hanging the agent, esptool failing against a port a monitor holds (which looks exactly like a bricked board), leaked serial file descriptors wedging the whole session — comes from multiple processes fighting over the port. So `hwlog` never lets that fight happen:
 
 - The **capture daemon** (`hwlog start`, or foreground `hwlog monitor`) opens the port exclusively and writes everything to a session directory.
-- **Queries** (`hwlog logs`, `boots`, `crashes`, `sessions`, and all MCP read tools) only read session files. They work while capture runs, after it stops, and from any number of processes at once.
+- **Recorded-evidence queries** (`hwlog summary`, `logs`, `boots`, `crashes`, and `sessions`) only read session files. They work while capture runs, after it stops, and from any number of processes at once. Port discovery uses USB descriptors; capture status queries the daemon control socket.
 - **Control operations** that genuinely need the port (send-to-device, pause/resume around flashing, stop) go through a Unix-socket control channel to the daemon.
 
 ## Session storage
@@ -95,6 +95,13 @@ Structured text is terminal-sanitized; the exact device bytes remain available o
 
 ## What hwlog is not
 
+- Not a real-time controller or an MHS protocol implementation. Device-level safety limits belong in firmware or a driver; see [MHS-inspired design notes](./mhs-design-notes.md).
 - Not a flasher — it wraps yours (`idf.py`, `arduino-cli`, `pio`, raw `esptool`).
 - Not a firmware library — nothing to compile in; it consumes whatever your board already prints.
 - Not a dashboard — sessions are plain JSONL; point `jq`, a notebook, or a UI at them.
+
+## Capability discovery and evidence summaries
+
+`capabilities.py` supplies the same versioned host capability manifest to the CLI and MCP. Limits are imported from their implementing modules; write availability reflects the calling process's environment. `ports.filter_boards` combines descriptor filters before MCP response caps, preserving existing port-selection rules.
+
+`summary.py` streams one bounded snapshot through the existing regular-file JSONL reader. Optional `ScanStats` reports scan availability, byte coverage, rejected records and an incomplete tail without changing existing query results. Counts do not collapse repeats. Memory is bounded by the scan and record limits, a recent-fault deque and a 20-entry tag map; the summary retains no full log history. Output projects allowlisted fields, strips terminal controls and caps each string by character count and serialized JSON size. The JSON report is bounded at 32 KiB. It contains observations and coverage, not a synthetic health verdict. Metadata and logs are read separately, so a running capture can advance between them.

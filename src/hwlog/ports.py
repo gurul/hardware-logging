@@ -8,6 +8,7 @@ on every reconnect rather than trusting a stored path.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from serial.tools import list_ports
@@ -68,6 +69,44 @@ def discover() -> list[Board]:
         )
     boards.sort(key=lambda b: (not b.is_known, b.device))
     return boards
+
+
+def filter_boards(
+    boards: Iterable[Board],
+    *,
+    match: str | None = None,
+    vid: int | None = None,
+    pid: int | None = None,
+    serial_number: str | None = None,
+) -> list[Board]:
+    """Narrow discovery before response limits; never open a port.
+
+    Text matches are case-insensitive substrings across device, description,
+    hint and location. USB identifiers and serial numbers match exactly.
+    """
+    for name, value in (("vid", vid), ("pid", pid)):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFF
+        ):
+            raise ValueError(f"{name} must be an integer between 0 and 65535")
+    for name, value in (("match", match), ("serial_number", serial_number)):
+        if value is not None and (not isinstance(value, str) or len(value) > 1024):
+            raise ValueError(f"{name} must be a string of at most 1024 characters")
+    needle = match.casefold() if match else None
+    return [
+        board
+        for board in boards
+        if (vid is None or board.vid == vid)
+        and (pid is None or board.pid == pid)
+        and (serial_number is None or board.serial_number == serial_number)
+        and (
+            needle is None
+            or any(
+                needle in (value or "").casefold()
+                for value in (board.device, board.description, board.hint, board.location)
+            )
+        )
+    ]
 
 
 def resolve_port(spec: str | None = None) -> Board | None:

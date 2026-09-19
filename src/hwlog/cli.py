@@ -17,6 +17,7 @@ import typer
 from . import __version__, daemon, query
 from . import flash as flash_mod
 from . import ports as ports_mod
+from . import summary as summary_mod
 from .capture import CaptureLoop
 from .parsers import strip_ansi
 from .records import SessionMeta, now_iso
@@ -73,9 +74,28 @@ def version() -> None:
 
 
 @app.command("ports")
-def ports_cmd(json_out: bool = typer.Option(False, "--json", help="NDJSON output")) -> None:
+def ports_cmd(
+    json_out: bool = typer.Option(False, "--json", help="NDJSON output"),
+    match: str | None = typer.Option(
+        None, "--match", help="Text in port, description, board or location"
+    ),
+    vid: str | None = typer.Option(None, "--vid", help="USB vendor ID, decimal or 0x-prefixed hex"),
+    pid: str | None = typer.Option(
+        None, "--pid", help="USB product ID, decimal or 0x-prefixed hex"
+    ),
+    serial_number: str | None = typer.Option(None, "--serial", help="Exact USB serial number"),
+) -> None:
     """List serial ports, likely dev boards first."""
-    boards = ports_mod.discover()
+    try:
+        boards = ports_mod.filter_boards(
+            ports_mod.discover(),
+            match=match,
+            vid=int(vid, 16 if vid.lower().startswith("0x") else 10) if vid is not None else None,
+            pid=int(pid, 16 if pid.lower().startswith("0x") else 10) if pid is not None else None,
+            serial_number=serial_number,
+        )
+    except ValueError as exc:
+        _fail(str(exc))
     if json_out:
         for b in boards:
             typer.echo(json.dumps(b.__dict__))
@@ -87,6 +107,59 @@ def ports_cmd(json_out: bool = typer.Option(False, "--json", help="NDJSON output
         marker = "●" if b.is_known else " "
         hint = f"  [{strip_ansi(b.hint)}]" if b.hint else ""
         typer.echo(f"{marker} {strip_ansi(b.device)}  {strip_ansi(b.description)}{hint}")
+
+
+@app.command()
+def describe() -> None:
+    """Print a JSON capability manifest: operations, bounds and write policy."""
+    from .capabilities import describe as describe_capabilities
+
+    typer.echo(json.dumps(describe_capabilities(), indent=2, ensure_ascii=True))
+
+
+@app.command()
+def summary(
+    session: str | None = typer.Option(None, "--session", "-s"),
+    json_out: bool = typer.Option(False, "--json", help="Structured evidence summary"),
+    scan_bytes: int = typer.Option(
+        summary_mod.MAX_SCAN_BYTES, "--scan-bytes", help="Newest bytes to scan, capped at 16 MiB"
+    ),
+) -> None:
+    """Compact session evidence: counts, recent faults, firmware and data coverage."""
+    s = _session_or_fail(session)
+    try:
+        result = summary_mod.summarize(s, scan_bytes=scan_bytes)
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        _fail(str(exc))
+    if json_out:
+        typer.echo(json.dumps(result, ensure_ascii=True))
+        return
+    counts = result["counts"]
+    typer.echo(f"session: {result['session_id']}  port: {result['device']['port']}")
+    typer.echo(
+        f"scanned records={counts['records']} errors={counts['errors']} "
+        f"warnings={counts['warnings']} boot_events={counts['boot_events']} "
+        f"crashes={counts['crashes']} latest_boot={result['latest_boot']}"
+    )
+    scan = result["scan"]
+    typer.echo(
+        f"coverage: available={scan['available']} "
+        f"bytes={scan['scanned_bytes']}/{scan['file_bytes']} "
+        f"truncated={scan['truncated']} skipped={scan['skipped_records']} "
+        f"incomplete_tail={scan['incomplete_tail']}"
+    )
+    typer.echo(f"firmware: {json.dumps(result['firmware'])}")
+    typer.echo(f"storage: {json.dumps(result['storage'])}")
+    for fault in result["recent_faults"]:
+        typer.echo(
+            f"[UNTRUSTED DEVICE OUTPUT] seq={fault['seq']} b{fault['boot']} "
+            f"{fault['level'] or fault['event']} {fault['tag'] or ''}: {fault['msg']}"
+        )
+    if result["omitted_faults"]:
+        typer.echo(f"({result['omitted_faults']} older fault records omitted)")
+    typer.echo(
+        "Counts describe the scanned window; absence of faults does not prove device health."
+    )
 
 
 @app.command()

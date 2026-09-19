@@ -14,6 +14,8 @@ from fastmcp import FastMCP
 
 from . import daemon, query
 from . import ports as ports_mod
+from . import summary as summary_mod
+from .capabilities import describe
 from .parsers import strip_ansi
 from .safety import MAX_WAIT_SECONDS, PatternError
 from .session import list_sessions, read_meta, resolve_session
@@ -23,6 +25,8 @@ mcp = FastMCP(
     instructions=(
         "Structured serial logs from embedded boards (ESP32 etc.). Capture runs as a "
         "separate daemon (`hwlog start`); these tools query recorded sessions. "
+        "Start with describe_capabilities, filtered list_serial_ports and summarize_session. "
+        "Pass the selected session explicitly when multiple devices are in use. "
         "Typical loop: flash firmware with `hwlog flash -- <cmd>` (shell), then "
         "wait_for_pattern to verify behavior, then query_logs/get_crash to debug. "
         "Prefer boot=-1 (latest boot) and small tails; escalate to bigger windows "
@@ -158,9 +162,38 @@ def _session(selector: str | None = None):
 
 
 @mcp.tool
-def list_serial_ports() -> list[dict]:
-    """List serial ports with board identification (likely dev boards first)."""
-    boards = ports_mod.discover()
+def describe_capabilities() -> dict:
+    """Describe hwlog operations, discovery filters, limits and current MCP write policy."""
+    return describe()
+
+
+@mcp.tool
+def summarize_session(session: str | None = None) -> dict:
+    """Compact recorded evidence: recent faults, counts, firmware and data coverage.
+
+    Scan at most 16 MiB; return at most 32 KiB. Counts refer only to that window.
+    Check scan/storage coverage before drawing conclusions; silence is not health.
+    Select a session explicitly when more than one device is in use.
+    """
+    return summary_mod.summarize(_session(session))
+
+
+@mcp.tool
+def list_serial_ports(
+    match: str | None = None,
+    vid: int | None = None,
+    pid: int | None = None,
+    serial_number: str | None = None,
+) -> list[dict]:
+    """Discover boards; filter before limiting output to 100 ports.
+
+    match: case-insensitive substring in port, description, board hint or location.
+    vid/pid: exact USB IDs (integers); serial_number: exact USB serial number.
+    All supplied filters are combined. Discovery never opens a serial port.
+    """
+    boards = ports_mod.filter_boards(
+        ports_mod.discover(), match=match, vid=vid, pid=pid, serial_number=serial_number
+    )
     rows = []
     fields_truncated = False
     for board in boards[:MAX_PORT_ROWS]:
@@ -194,9 +227,17 @@ def list_serial_ports() -> list[dict]:
 
 
 @mcp.tool
-def capture_status() -> dict:
-    """Status of the capture daemon: running, connected, current session, counts."""
-    daemons = daemon.list_daemons()
+def capture_status(port: str | None = None) -> dict:
+    """Capture status and session selector; use port to select one of several daemons."""
+    if port is None:
+        daemons = daemon.list_daemons()
+    else:
+        try:
+            selected = daemon.find_daemon(port)
+        except daemon.AmbiguousDaemonError as exc:
+            error, shortened = _bounded_clean_text(str(exc), MAX_STATUS_FIELD_CHARS)
+            return {"running": True, "ambiguous": True, "error": error, "truncated": shortened}
+        daemons = [selected] if selected is not None else []
     if not daemons:
         return {"running": False, "hint": "start capture with `hwlog start` in a shell"}
     if len(daemons) > 1:
