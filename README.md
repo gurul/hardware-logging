@@ -60,8 +60,6 @@ claude mcp add hardware-logging -- uvx --from hardware-logging hwlog mcp
 
 Agents get `describe_capabilities`, filtered `list_serial_ports`, `summarize_session`, `query_logs`, `list_boots`, `get_crash`, `wait_for_pattern`, `send_to_device`, and `capture_status(port=...)`. Device telemetry is labeled untrusted, and MCP device writes are disabled unless the user sets `HWLOG_MCP_ALLOW_SEND=1`. Session data and the daemon control channel are owner-only; storage and query scans are bounded by default — see [storage limits](./docs/cli.md#storage-limits).
 
-The [MHS-inspired design notes](./docs/mhs-design-notes.md) explain the discovery and observation workflow. hwlog remains a serial evidence tool: it does not implement MHS, infer a device's command schema, or enforce physical safety limits.
-
 ## The agent debug loop
 
 1. `hwlog start` — capture runs continuously, owns the port
