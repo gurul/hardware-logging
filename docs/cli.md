@@ -1,3 +1,8 @@
+---
+title: CLI reference
+order: 3
+---
+
 # CLI reference
 
 Query commands print compact text by default and NDJSON with `--json`; `summary --json` returns one summary object. `describe` always prints JSON. Exit codes are part of the contract.
@@ -35,6 +40,12 @@ daemon's own, never a reused PID.
 
 ## Query
 
+Records carry three different ordering clues: `seq` is capture order within one
+session, `ts` is the host's UTC wall-clock time, and `dev_ts` is optional
+device-reported time in milliseconds. Wall-clock adjustments can change timestamp
+order; hwlog does not synchronize clocks across devices or infer causal order.
+Use the session ID, boot index, and sequence together when following an incident.
+
 ### `hwlog summary [--session ID] [--json] [--scan-bytes N]`
 Start an investigation with compact recorded evidence. The JSON object includes device identity, firmware/ELF generations, persisted storage-loss counters, observed record/error/warning/boot-event/crash counts, the latest observed boot index, the last record, and the newest eight fault records (warnings, errors or crash events). Counts include repeats; they measure records, not unique incidents. Up to 20 distinct tags are tracked, in first-seen order within the scan and displayed by frequency; `untracked_tag_records` counts records belonging to additional tags.
 
@@ -53,13 +64,22 @@ Bounded log query over the current (or `--session`) session.
 | `--grep/-g STR` | case-insensitive substring on message |
 | `--tag STR` | exact tag match |
 | `--since ISO` | timestamp lower bound |
-| `--no-collapse` | keep repeated lines instead of `msg (×N)` |
+| `--no-collapse` | keep repeated log records instead of `msg (×N)` |
 | `--json` | NDJSON records |
 | `--scan-bytes N` | inspect at most the newest N bytes (default 64 MiB, or `HWLOG_QUERY_SCAN_BYTES`) |
 
 When the scan window omits older data, the command prints a warning on stderr;
 an empty result then means "no match in the scanned window," not necessarily the
 entire session.
+
+Repeat collapse groups consecutive log records only when their boot, severity,
+tag, message, source location, and structured payload match. It retains the newest
+timestamp/sequence and adds `extra.repeat` to the returned record. Boot, crash,
+status, and sent events remain separate, even if their text is identical.
+Use `--no-collapse` to inspect every recorded log entry.
+Collapsed output retains the newest record's time fields, so use the original
+records when individual timing intervals matter. See [research notes](./research-notes.md)
+for the evidence-preservation rationale.
 
 ### `hwlog boots [--json] [--scan-bytes N]`
 One row per boot cycle in the bounded newest-byte window: start time,
@@ -91,14 +111,22 @@ Run any flash command under an exclusive pause lease, then conservatively discov
 
 Capture resumes when the wrapped process exits, with the target daemon resumed before unrelated captures. Output emitted while the flash tool still owns the port—including firmware output during tool-side cleanup before exit—cannot be recorded.
 
+`--port` selects hwlog's capture; it does not inject a port argument into the
+wrapped command. Give both tools the same target when flashing an explicit board.
+
 ```bash
-hwlog flash -- idf.py -p /dev/cu.usbmodem101 flash
+hwlog flash --port /dev/cu.usbmodem101 -- idf.py -p /dev/cu.usbmodem101 flash
 hwlog flash -- arduino-cli upload --fqbn esp32:esp32:esp32s3 .
 hwlog flash -- pio run -t upload
 ```
 
 ### `hwlog wait --pattern REGEX [--timeout S] [--from-start]`
 Block until the pattern appears in device output. Exit 0 = matched (record printed), 1 = timeout, 2 = invalid input/no session. By default a post-flash wait starts at the latest flash boundary, so output captured after resume but before `wait` starts still counts; without a boundary it starts at the invocation-time end of the log. `--from-start` scans the existing session too. Patterns are limited to 512 characters, each match has an execution timeout, and waits are capped at 120 seconds.
+
+The follower retains incomplete lines between reads. If the log file is replaced
+or shrinks below its read offset, it resets to the beginning and discards partial
+bytes from the previous file. Reads remain byte-bounded. This recovers file
+replacement; it cannot recover bytes lost before capture wrote them.
 
 ### `hwlog send TEXT [--no-newline]`
 Send a line to the device through the daemon — stimulus injection for firmware with a debug command handler. Payloads are capped at 4096 bytes; the host-generated `sent` record stores only the byte count. Firmware or terminal echo is device telemetry and remains in `log.jsonl` and `raw.log`, so do not send secrets to echoing firmware.

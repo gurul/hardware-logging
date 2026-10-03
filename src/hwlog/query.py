@@ -14,12 +14,12 @@ import stat
 import time
 from collections import deque
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .crash import MAX_CRASH_ARTIFACT_BYTES, MAX_CRASH_CONTENT_CHARS
 from .parsers import strip_ansi
-from .records import MAX_MESSAGE_CHARS, MAX_SRC_CHARS, MAX_TAG_CHARS, LogRecord
+from .records import MAX_MESSAGE_CHARS, MAX_SRC_CHARS, MAX_TAG_CHARS, Event, LogRecord
 from .safety import bounded_timeout, compile_pattern, pattern_matches
 
 # Severity order for --level filters: showing W means E and W.
@@ -245,16 +245,19 @@ def tail(records: Iterable[LogRecord], n: int = DEFAULT_TAIL) -> list[LogRecord]
 
 
 def collapse_repeats(records: Iterable[LogRecord]) -> Iterator[LogRecord]:
-    """Collapse consecutive identical (event, level, tag, msg) records into one
-    record annotated with a repeat count — heartbeat/flood control."""
+    """Collapse identical log messages within one boot without mutating inputs.
+
+    Preserve lifecycle events and differences in source or structured payload.
+    Collapsed logs keep the newest timestamp and sequence number.
+    """
     prev: LogRecord | None = None
     count = 0
     for r in records:
-        if prev is not None and (r.event, r.level, r.tag, r.msg) == (
-            prev.event,
-            prev.level,
-            prev.tag,
-            prev.msg,
+        if (
+            prev is not None
+            and r.event == prev.event == Event.LOG
+            and (r.boot, r.level, r.tag, r.msg, r.src, r.extra)
+            == (prev.boot, prev.level, prev.tag, prev.msg, prev.src, prev.extra)
         ):
             count += 1
             prev = r  # keep the newest timestamp
@@ -268,7 +271,7 @@ def collapse_repeats(records: Iterable[LogRecord]) -> Iterator[LogRecord]:
 
 def _annotate(record: LogRecord, count: int) -> LogRecord:
     if count > 1:
-        record.extra = {**(record.extra or {}), "repeat": count}
+        return replace(record, extra={**(record.extra or {}), "repeat": count})
     return record
 
 
@@ -406,7 +409,7 @@ def format_record(r: LogRecord) -> str:
 
 
 class LogFollower:
-    """Incrementally read complete JSONL records without losing a torn tail."""
+    """Read complete JSONL records, recovering from truncation or replacement."""
 
     def __init__(
         self,
@@ -416,12 +419,15 @@ class LogFollower:
         start_offset: int | None = None,
     ) -> None:
         self.path = path
+        self._identity: tuple[int, int] | None = None
         initial = _open_regular(path)
         if initial is None:
             self.offset = 0
         else:
             with initial:
-                size = os.fstat(initial.fileno()).st_size
+                info = os.fstat(initial.fileno())
+                self._identity = (info.st_dev, info.st_ino)
+                size = info.st_size
                 if from_start:
                     self.offset = 0
                 elif start_offset is not None:
@@ -437,11 +443,15 @@ class LogFollower:
             return []
         try:
             with f:
-                size = os.fstat(f.fileno()).st_size
-                if size < self.offset:
+                info = os.fstat(f.fileno())
+                identity = (info.st_dev, info.st_ino)
+                # Offsets and partial records belong to the opened inode, not
+                # its path. A replacement can be larger than the old file.
+                if identity != self._identity or info.st_size < self.offset:
                     self.offset = 0
                     self._pending = b""
                     self._discarding_oversized = False
+                self._identity = identity
                 f.seek(self.offset)
                 chunk = f.read(max(1, min(max_bytes, FOLLOW_READ_BYTES)))
         except OSError:

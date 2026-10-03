@@ -56,6 +56,9 @@ dev = [
 requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = ["/.firecrawl/", "/.unlazy/"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/hwlog"]
 
