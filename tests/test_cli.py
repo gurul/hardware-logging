@@ -111,3 +111,32 @@ def test_crashes_json_is_ndjson(make_session):
     assert json.loads(last_result.output) == report
     assert len(result.output.splitlines()) == 1
     assert len(last_result.output.splitlines()) == 1
+
+
+def test_status_explains_why_a_daemon_is_disconnected(make_session, monkeypatch):
+    from hwlog import cli, daemon
+    from hwlog.records import LogRecord
+
+    session = make_session([("I", "app", "x")])
+    busy = "open failed on /dev/cu.usbmodem101: [Errno 35] Could not exclusively lock port"
+    with (session / "log.jsonl").open("a") as log:
+        log.write(
+            LogRecord(
+                ts="2026-11-17T10:00:00.000Z", seq=9, boot=0, event="status", msg=busy
+            ).to_json()
+            + "\n"
+        )
+    state = {"pid": 4242, "port": "/dev/cu.usbmodem101", "session": str(session)}
+    monkeypatch.setattr(daemon, "list_daemons", lambda: [state])
+    monkeypatch.setattr(
+        daemon, "send_cmd", lambda _state, _req: {"ok": True, "connected": False, "boots": 0}
+    )
+    res = runner.invoke(cli.app, ["status"])
+    assert "disconnected" in res.output and f"last status: {busy}" in res.output
+    as_json = runner.invoke(cli.app, ["status", "--json"])
+    assert busy in as_json.output
+
+    monkeypatch.setattr(
+        daemon, "send_cmd", lambda _state, _req: {"ok": True, "connected": True, "boots": 0}
+    )
+    assert "last status" not in runner.invoke(cli.app, ["status"]).output

@@ -40,6 +40,20 @@ app = typer.Typer(
 MAX_CLI_CRASH_ROWS = 500
 MAX_CLI_SUMMARY_CHARS = 512
 MAX_CLI_BOOT_ROWS = 500
+STATUS_REASON_SCAN_BYTES = 64 * 1024
+
+
+def _last_capture_status(session: Path) -> str | None:
+    """Newest capture-side status message: why a daemon is not connected."""
+    last = None
+    try:
+        records = query.iter_records(session, max_bytes=STATUS_REASON_SCAN_BYTES)
+        for record in records:
+            if record.event == "status":
+                last = record.msg
+    except OSError:
+        return None
+    return strip_ansi(last)[:MAX_CLI_SUMMARY_CHARS] if last else None
 
 
 def _fail(msg: str, code: int = 2) -> None:
@@ -269,6 +283,11 @@ def status(json_out: bool = typer.Option(False, "--json")) -> None:
                     "dropped_crashes": meta.dropped_crashes,
                 }
             )
+        reason = None
+        if not resp.get("connected"):
+            reason = _last_capture_status(Path(state["session"]))
+            if reason is not None:
+                info["last_status"] = reason
         if json_out:
             typer.echo(json.dumps(info))
         else:
@@ -289,6 +308,8 @@ def status(json_out: bool = typer.Option(False, "--json")) -> None:
                 f"records={resp.get('records')}\n  session: {strip_ansi(str(state['session']))}"
                 f"{storage}"
             )
+            if reason is not None:
+                typer.echo(f"  last status: {reason}")
 
 
 @app.command()

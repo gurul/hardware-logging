@@ -84,7 +84,7 @@ stopped and its ownership is verified.
 
 ELF archiving happens in `hwlog flash`: a backtrace is only symbolizable against the exact build that produced it, so every flash attempt retires the prior association. The wrapper archives a content-hashed candidate only when one changed artifact can be identified unambiguously, or when a known upload tool has one unchanged candidate whose content matches the prior archive. Registration carries the firmware generation, preventing delayed work from attaching stale symbols to a later flash. This is conservative, best-effort provenance: a generic flasher does not report which artifact it actually programmed, so an ambiguous build leaves symbolization pending instead of guessing.
 
-The post-flash log offset is persisted before capture resumes. A following `wait` therefore includes startup output recorded before the wait command begins. The generic wrapper cannot capture output emitted before the flash process exits while that process still owns the serial port.
+A flash attempt also opens a new boot cycle on the target capture, because the board's reset banner is printed while the flasher still owns the port. The post-flash log offset is persisted before capture resumes. A following `wait` therefore includes startup output recorded before the wait command begins. The generic wrapper cannot capture output emitted before the flash process exits while that process still owns the serial port.
 
 ## Bounded queries
 

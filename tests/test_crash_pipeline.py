@@ -167,3 +167,57 @@ def test_idle_flush_waits_for_the_quiet_period(monkeypatch):
     finally:
         cap.stop()
         thread.join(timeout=5)
+
+
+def test_flash_boundary_starts_a_boot_without_a_reset_banner(monkeypatch):
+    ser, cap, thread = start_loop(monkeypatch)
+    session = resolve_session()
+    try:
+        ser.write(b"E (10) app: old firmware line\n")
+        assert wait_for(
+            lambda: any(r.msg == "old firmware line" for r in query.iter_records(session))
+        )
+        assert cap.pause(timeout=5)
+        reopened = serial.serial_for_url("loop://", timeout=0.05)
+        cap.serial_factory = lambda d, b: reopened
+        # The flasher reset the board while it held the port: no banner arrives.
+        cap.resume(awaiting_elf=True, record_flash_boundary=True)
+        assert wait_for(lambda: cap.connected)
+        reopened.write(b"HELLO\n")
+        assert wait_for(lambda: any(r.msg == "HELLO" for r in query.iter_records(session)))
+        records = list(query.iter_records(session))
+        assert next(r for r in records if r.msg == "old firmware line").boot == 0
+        assert next(r for r in records if r.msg == "HELLO").boot == 1
+        boot_events = [r for r in records if r.event == "boot"]
+        assert len(boot_events) == 1 and boot_events[0].extra["source"] == "flash"
+
+        # A banner that does arrive belongs to the same boot; the next reset is new.
+        reopened.write(b"rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)\n")
+        reopened.write(b"I (20) app: after banner\n")
+        assert wait_for(lambda: any(r.msg == "after banner" for r in query.iter_records(session)))
+        assert next(r for r in query.iter_records(session) if r.msg == "after banner").boot == 1
+        monkeypatch.setattr(capture_mod, "BOOT_DEBOUNCE_S", 0.0)
+        reopened.write(b"rst:0xc (RTC_SW_CPU_RST)\nI (5) app: real reboot\n")
+        assert wait_for(lambda: any(r.msg == "real reboot" for r in query.iter_records(session)))
+        assert next(r for r in query.iter_records(session) if r.msg == "real reboot").boot == 2
+    finally:
+        cap.stop()
+        thread.join(timeout=5)
+    assert query.resolve_boot(session, -1) == 2
+
+
+def test_plain_resume_does_not_start_a_boot(monkeypatch):
+    ser, cap, thread = start_loop(monkeypatch)
+    session = resolve_session()
+    try:
+        assert cap.pause(timeout=5)
+        reopened = serial.serial_for_url("loop://", timeout=0.05)
+        cap.serial_factory = lambda d, b: reopened
+        cap.resume()  # an unrelated board paused during another board's flash
+        assert wait_for(lambda: cap.connected)
+        reopened.write(b"still here\n")
+        assert wait_for(lambda: any(r.msg == "still here" for r in query.iter_records(session)))
+        assert all(r.boot == 0 for r in query.iter_records(session))
+    finally:
+        cap.stop()
+        thread.join(timeout=5)

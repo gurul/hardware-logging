@@ -33,7 +33,9 @@ Foreground capture with live output. Records a full session exactly like the dae
 ### `hwlog stop [--port SPEC]` / `hwlog status [--json]`
 Stop the daemon / show daemon + session status. Status includes the configured
 session storage limit and persisted raw-byte, structured-record, and crash drop
-counters if capture reached a storage cap. If the daemon's control channel is
+counters if capture reached a storage cap. For a daemon that is not connected,
+status adds the newest capture-side status message (`last status:`), for
+example that another program holds the port. If the daemon's control channel is
 unresponsive, `stop` falls back to signaling the daemon process — only after
 re-validating through the daemon lock that the recorded PID is still the
 daemon's own, never a reused PID.
@@ -116,6 +118,8 @@ registration cannot be mistaken for stale data.
 
 ### `hwlog flash [--port SPEC] -- <command...>`
 Run any flash command under an exclusive pause lease, then conservatively discover and archive at most one ELF candidate for backtrace symbolization. Multiple concurrent wrappers are rejected. Every attempted command invalidates the previous firmware/ELF association, including a nonzero exit because the device may have been partially programmed. A successful ESP-IDF, PlatformIO, west or arduino-cli upload may reuse an unchanged ELF only when its content exactly matches the last archive; otherwise, if no candidate can be identified without ambiguity, the new generation remains unassociated and crashes stay undecoded. Generic flash commands do not expose which binary they programmed, so automatic ELF discovery is best-effort provenance rather than proof that the selected artifact reached the device. Exit code = the flash command's exit code; a flasher killed by a signal reports 128 plus the signal number, as a shell does.
+
+The flash boundary starts a new boot cycle on the flashed board, recorded as a `boot` event with `extra.source = "flash"`. A flasher resets the board while it still owns the port, so the ROM reset banner is usually lost; without this rule the new firmware's output stayed in the old boot. A banner that does arrive within 30 seconds belongs to that same boot. Other captures paused for the flash keep their boot index.
 
 Capture resumes when the wrapped process exits, with the target daemon resumed before unrelated captures. Output emitted while the flash tool still owns the port—including firmware output during tool-side cleanup before exit—cannot be recorded.
 

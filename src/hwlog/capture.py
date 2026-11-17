@@ -41,6 +41,10 @@ BOOT_DEBOUNCE_S = 3.0  # ROM emits several marker lines per reset; count once
 # last crash line means the device halted or kept running without a reboot
 # marker; publish the artifact instead of holding it until the port closes.
 CRASH_IDLE_FLUSH_S = 2.0
+# A flasher resets the board while it still owns the port, so the ROM banner is
+# usually lost. The flash boundary therefore starts a boot by itself; a banner
+# that does arrive within this window belongs to that same boot.
+FLASH_BOOT_MARKER_WINDOW_S = 30.0
 REOPEN_BACKOFF_S = (1.0, 2.0, 5.0, 10.0, 15.0)  # then stay at 15s
 MAX_STRUCTURED_LINE_BYTES = 8192
 MAX_SEND_BYTES = 4096
@@ -93,6 +97,7 @@ class CaptureLoop:
         self._boot = 0
         self._last_boot_mark = 0.0
         self._last_crash_line = 0.0
+        self._flash_boot_until = 0.0
         self._addr2line_cache: dict[str, str | None] = {}
         self._ser: serial.Serial | None = None
         self._buf = b""
@@ -165,6 +170,16 @@ class CaptureLoop:
                     for crash_id, pending in self._unresolved_crashes.items()
                     if pending[0] == generation
                 }
+        if awaiting_elf:
+            # The port is closed here, so the capture thread records nothing
+            # between this boot change and the reopen.
+            self._boot = self.writer.note_boot()
+            self._flash_boot_until = time.monotonic() + FLASH_BOOT_MARKER_WINDOW_S
+            self._record(
+                Event.BOOT,
+                msg="boot assumed at flash boundary",
+                extra={"source": "flash", "firmware_generation": generation},
+            )
         self.pause_event.clear()
         self._wake_event.set()
         return generation
@@ -550,7 +565,11 @@ class CaptureLoop:
 
         if parsed.is_boot_marker:
             now = time.monotonic()
-            if now - self._last_boot_mark > BOOT_DEBOUNCE_S:
+            if now < self._flash_boot_until:
+                # The reset banner of the boot that the flash boundary opened.
+                self._flash_boot_until = 0.0
+                self._last_boot_mark = now
+            elif now - self._last_boot_mark > BOOT_DEBOUNCE_S:
                 self._boot = self.writer.note_boot()
                 self._record(Event.BOOT, msg=parsed.msg)
                 self._last_boot_mark = now

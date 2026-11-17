@@ -222,7 +222,9 @@ def test_pathological_regex_is_stopped_by_execution_timeout() -> None:
     with pytest.raises(PatternError, match="execution limit"):
         pattern_matches(compiled, "a" * 10_000 + "!")
 
-    assert time.monotonic() - started < 0.5
+    # The engine limit is 0.05 s. The bound proves "stopped", with room for a
+    # loaded machine: 0.5 s failed twice in 36 runs under six parallel suites.
+    assert time.monotonic() - started < 2.0
 
 
 def test_huge_counted_repeat_is_rejected_before_regex_compilation() -> None:
