@@ -327,15 +327,16 @@ def query_logs(
 ) -> list[str]:
     """Query captured device logs, newest last. Bounded: max 500 lines.
 
-    boot: exact boot index, or -1 for the latest boot cycle (recommended).
+    boot: exact boot index, or -1 for the latest boot cycle (recommended);
+    -2 is the boot before it, and so on.
     level: minimum severity — E (errors only), W, I, D, V.
-    grep: case-insensitive substring filter on the message.
+    grep: case-insensitive substring of the message or of `tag: message`.
     collapse_repeats: fold repeated identical lines into one entry with a count.
     """
     s = _session(session)
     if level is not None and level.upper() not in query.LEVEL_ORDER:
         raise ValueError("level must be one of E, W, I, D, V")
-    b = query.latest_boot(s, max_bytes=MAX_SCAN_BYTES) if boot == -1 else boot
+    b = query.resolve_boot(s, boot, max_bytes=MAX_SCAN_BYTES)
     recs = query.filter_records(
         query.iter_records(s, max_bytes=MAX_SCAN_BYTES),
         boot=b,
@@ -418,21 +419,37 @@ def send_to_device(text: str, newline: bool = True, port: str | None = None) -> 
 
 
 @mcp.tool
-def wait_for_pattern(pattern: str, timeout_s: float = 30.0, session: str | None = None) -> dict:
+def wait_for_pattern(
+    pattern: str,
+    timeout_s: float = 30.0,
+    session: str | None = None,
+    fail_on_crash: bool = False,
+) -> dict:
     """Block until PATTERN (regex) appears in NEW device output, or time out.
 
     The behavioral-verification primitive: after flashing, assert the expected
-    log line actually appears instead of assuming success. Max timeout 120s."""
+    log line actually appears instead of assuming success. Max timeout 120s.
+    The pattern is tried against the message and against `tag: message`.
+    fail_on_crash: return at once with crashed=true when a crash is recorded
+    before the pattern, instead of waiting for the timeout."""
     s = _session(session)
     try:
-        record = query.wait_for_record(s, pattern, timeout_s)
+        outcome = query.wait_for_outcome(s, pattern, timeout_s, stop_on_crash=fail_on_crash)
     except (PatternError, ValueError) as exc:
         return {"matched": False, "error": str(exc)}
-    if record is not None:
+    if outcome.reason == "crash":
+        return {
+            "matched": False,
+            "crashed": True,
+            "trust": "untrusted_device_output",
+            "record": _format_untrusted_record(outcome.record),
+            "hint": "a crash was recorded before the pattern; call get_crash",
+        }
+    if outcome.reason == "matched":
         return {
             "matched": True,
             "trust": "untrusted_device_output",
-            "record": _format_untrusted_record(record),
+            "record": _format_untrusted_record(outcome.record),
         }
     return {
         "matched": False,

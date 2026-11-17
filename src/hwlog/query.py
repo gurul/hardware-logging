@@ -232,9 +232,35 @@ def filter_records(
             continue
         if since is not None and r.ts < since:
             continue
-        if grep_lower is not None and grep_lower not in r.msg.lower():
+        if grep_lower is not None and not any(
+            grep_lower in text.lower() for text in searchable_texts(r)
+        ):
             continue
         yield r
+
+
+def searchable_texts(record: LogRecord) -> tuple[str, ...]:
+    """Texts a grep or wait pattern is tried against, cheapest first.
+
+    Parsing splits ``I (12) wifi: connected`` into a tag and a message. A user
+    who copies ``wifi: connected`` from a serial monitor expects it to match,
+    so the ``tag: message`` rendering is searchable as well as the message.
+    """
+    if record.tag:
+        return (record.msg, f"{record.tag}: {record.msg}")
+    return (record.msg,)
+
+
+def resolve_boot(session: Path, boot: int | None, *, max_bytes: int | None = None) -> int | None:
+    """Turn a boot selector into an absolute index.
+
+    Zero and positive values are exact. Negative values count back from the
+    latest boot in the scanned window: -1 is the latest boot, -2 the one before
+    it. A selector that reaches before boot 0 matches no record.
+    """
+    if boot is None or boot >= 0:
+        return boot
+    return max(-1, latest_boot(session, max_bytes=max_bytes) + 1 + boot)
 
 
 def tail(records: Iterable[LogRecord], n: int = DEFAULT_TAIL) -> list[LogRecord]:
@@ -484,6 +510,14 @@ class LogFollower:
         return records
 
 
+@dataclass(frozen=True)
+class WaitOutcome:
+    """Why a wait ended: ``matched``, ``crash`` or ``timeout``."""
+
+    reason: str
+    record: LogRecord | None = None
+
+
 def wait_for_record(
     session: Path,
     pattern: str,
@@ -492,6 +526,22 @@ def wait_for_record(
     from_start: bool = False,
 ) -> LogRecord | None:
     """Wait for a safe regex in complete, newly appended records."""
+    return wait_for_outcome(session, pattern, timeout, from_start=from_start).record
+
+
+def wait_for_outcome(
+    session: Path,
+    pattern: str,
+    timeout: float,
+    *,
+    from_start: bool = False,
+    stop_on_crash: bool = False,
+) -> WaitOutcome:
+    """Wait for a safe regex, optionally ending early on an assembled crash.
+
+    Records are judged in capture order, so a matching line that precedes a
+    crash still wins. A crash record whose own text matches counts as a match.
+    """
     compiled = compile_pattern(pattern)
     timeout = bounded_timeout(timeout)
     start_offset = None
@@ -514,10 +564,12 @@ def wait_for_record(
         # Each read() is byte-bounded, so the overrun is bounded too.
         records = follower.read()
         for record in records:
-            if pattern_matches(compiled, record.msg):
-                return record
+            if any(pattern_matches(compiled, text) for text in searchable_texts(record)):
+                return WaitOutcome("matched", record)
+            if stop_on_crash and record.event == Event.CRASH:
+                return WaitOutcome("crash", record)
         if time.monotonic() >= deadline:
-            return None
+            return WaitOutcome("timeout")
         # Drain a busy file without adding avoidable latency; otherwise poll.
         if len(records) == 0:
             time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))

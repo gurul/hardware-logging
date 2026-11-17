@@ -37,10 +37,10 @@ Capture still runs separately (`hwlog start`) — the MCP server reads session f
 |---|---|---|
 | `describe_capabilities()` | Versioned operations, discovery filters, limits and current MCP write policy | fixed host-generated manifest; no session needed |
 | `summarize_session(session?)` | Counts, recent faults, firmware generation and evidence coverage | 16 MiB scan; 32 KiB JSON; newest 8 faults; 20 tracked tags |
-| `query_logs(tail, boot, level, grep, tag, collapse_repeats)` | Structured log query; `boot=-1` = latest boot | 500 lines, 4096 chars/record, 100k chars total, 16 MiB scan |
+| `query_logs(tail, boot, level, grep, tag, collapse_repeats)` | Structured log query; `boot=-1` = latest boot, `-2` = the boot before it; `grep` also matches `tag: message` | 500 lines, 4096 chars/record, 100k chars total, 16 MiB scan |
 | `list_boots()` | Boot cycles with line/error/crash counts — the reboot-loop detector | latest rows within 64 KiB total from a 16 MiB scan |
 | `get_crash(crash_id?)` | Crash artifact, decoded backtrace when available; defaults to latest | one artifact, 64 KiB response |
-| `wait_for_pattern(pattern, timeout_s)` | Block until regex appears after the latest flash boundary (or in new output when no boundary exists) | timeout capped at 120s |
+| `wait_for_pattern(pattern, timeout_s, fail_on_crash?)` | Block until regex appears after the latest flash boundary (or in new output when no boundary exists). With `fail_on_crash=true`, a crash recorded first returns `{matched: false, crashed: true}` at once | timeout capped at 120s |
 | `send_to_device(text, port?)` | Opt-in stimulus injection over serial | disabled unless `HWLOG_MCP_ALLOW_SEND=1`; 4096 bytes; explicit port required when ambiguous |
 | `capture_status(port?)` | Daemon running? connected? which session? Optional port selects a daemon and refuses ambiguity | allowlisted fields; 32 KiB total; at most 100 ambiguous-daemon rows |
 | `list_serial_ports(match?, vid?, pid?, serial_number?)` | Board discovery with text, USB ID and exact serial filters; filters combine before response limits | 100 matching ports; 1024 chars/descriptor; 64 KiB total |

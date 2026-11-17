@@ -584,7 +584,7 @@ def test_backtrace_symbolization_does_not_block_capture(monkeypatch, tmp_path):
     decode_started = threading.Event()
     release_decode = threading.Event()
 
-    monkeypatch.setattr(capture_mod, "find_addr2line", lambda: "addr2line")
+    monkeypatch.setattr(capture_mod, "find_addr2line", lambda *_: "addr2line")
 
     def blocked_decode(_addresses, _elf_path, _tool):
         decode_started.set()
@@ -631,7 +631,7 @@ def test_crash_during_elf_archive_waits_for_new_firmware_symbols(monkeypatch, tm
     writer.add_elf(str(old_elf))
     loop = CaptureLoop(writer)
     decoded_with: list[str] = []
-    monkeypatch.setattr(capture_mod, "find_addr2line", lambda: "addr2line")
+    monkeypatch.setattr(capture_mod, "find_addr2line", lambda *_: "addr2line")
 
     def decode(_addresses, elf_path, _tool):
         decoded_with.append(elf_path)
@@ -665,7 +665,7 @@ def test_crash_is_never_symbolized_with_a_later_firmware_generation(monkeypatch,
     writer = make_writer()
     loop = CaptureLoop(writer)
     decoded: list[tuple[list[str], str]] = []
-    monkeypatch.setattr(capture_mod, "find_addr2line", lambda: "addr2line")
+    monkeypatch.setattr(capture_mod, "find_addr2line", lambda *_: "addr2line")
 
     def decode(addresses, elf_path, _tool):
         decoded.append((addresses, elf_path))

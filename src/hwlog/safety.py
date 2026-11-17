@@ -20,10 +20,13 @@ class PatternError(ValueError):
     """A pattern is invalid, too large, or too expensive to evaluate safely."""
 
 
-_COUNTED_REPEAT = stdlib_re.compile(r"\s*(\d+)\s*(?:,\s*(\d*)\s*)?")
+# The regex engine also accepts an omitted lower bound: "{,N}" means "{0,N}".
+_COUNTED_REPEAT = stdlib_re.compile(r"\s*(\d*)\s*(?:,\s*(\d*)\s*)?")
 # Verbose-mode flags ("(?x...)" — "#" comments hide parens from a scanner) and
-# comment groups ("(?#...)") make brace-to-group pairing untrustworthy.
-_OPAQUE_GROUP_SYNTAX = stdlib_re.compile(r"\(\?[aiLmsux\-]*[x#]")
+# comment groups ("(?#...)") make brace-to-group pairing untrustworthy. The
+# engine has more flag letters than the standard library ("w", "V1", "f", ...),
+# so any inline flag group that contains "x" takes the conservative path.
+_OPAQUE_GROUP_SYNTAX = stdlib_re.compile(r"\(\?[A-Za-z0-9\-]*[x#]")
 
 
 def _validate_counted_repeats(pattern: str) -> None:
@@ -57,6 +60,13 @@ def _validate_counted_repeats(pattern: str) -> None:
         if char == "[":
             in_class = True
             index += 1
+            # A "]" directly after "[" or "[^" is a literal member, not the end
+            # of the class. Reading it as the end would expose the rest of the
+            # class to this scanner as if it were pattern structure.
+            if index < len(pattern) and pattern[index] == "^":
+                index += 1
+            if index < len(pattern) and pattern[index] == "]":
+                index += 1
             continue
         if char == "(":
             open_groups.append(index)
@@ -79,6 +89,9 @@ def _validate_counted_repeats(pattern: str) -> None:
             index += 1
             continue
         counts = [int(value) for value in match.groups() if value]
+        if not counts:  # "{}" and "{,}" are literal text
+            index += 1
+            continue
         if any(count > MAX_REPEAT_COUNT for count in counts):
             raise PatternError(f"regex repeat count exceeds {MAX_REPEAT_COUNT}")
         if index > 0 and pattern[index - 1] == ")" and (index - 1) in group_start:
@@ -119,6 +132,8 @@ def _validate_counted_repeats_conservative(pattern: str) -> None:
         if match is None:
             continue
         repeat_counts = [int(value) for value in match.groups() if value]
+        if not repeat_counts:
+            continue
         if any(count > MAX_REPEAT_COUNT for count in repeat_counts):
             raise PatternError(f"regex repeat count exceeds {MAX_REPEAT_COUNT}")
         counts.append(max(repeat_counts))

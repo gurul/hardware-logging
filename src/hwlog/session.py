@@ -51,6 +51,13 @@ GLOBAL_USAGE_RECHECK_BYTES = 4 * 1024 * 1024
 QUOTA_ALLOWANCE_CHUNK_BYTES = 1024 * 1024
 MAX_STORAGE_SCAN_ENTRIES = 200_000
 UNREFERENCED_ELF_GRACE_SECONDS = 300
+# A writer that died without close() (kill -9, power loss) leaves a session
+# with no end time. Its writer lock is free; after this quiet period the
+# session counts as completed for pruning.
+ORPHAN_SESSION_GRACE_SECONDS = 3600
+# A global-limit cap can lift when another session completes. Retry at this
+# interval instead of taking the shared quota lock on every dropped write.
+GLOBAL_CAP_RETRY_SECONDS = 15.0
 _USAGE_COUNTER_BYTES = 32
 
 
@@ -452,6 +459,46 @@ def _prune_unreferenced_elf_paths(
     return removed
 
 
+def session_writer_is_live(session: Path) -> bool | None:
+    """Whether a writer process still holds this session.
+
+    A SessionWriter keeps an exclusive lock on its ``log.jsonl`` for its whole
+    life, and the kernel drops that lock when the process dies. Returns None
+    when the log cannot be opened, so callers can fail closed.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(session / "log.jsonl", flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _is_orphaned_session(path: Path) -> bool:
+    """A session with no live writer that has been quiet for the grace period."""
+    if session_writer_is_live(path) is not False:
+        return False
+    newest = 0.0
+    for name in ("meta.json", "log.jsonl", "raw.log"):
+        try:
+            newest = max(newest, (path / name).lstat().st_mtime)
+        except OSError:
+            continue
+    return newest > 0 and time.time() - newest >= ORPHAN_SESSION_GRACE_SECONDS
+
+
 def _safe_completed_session(path: Path, protected: set[Path]) -> bool:
     root = sessions_dir()
     try:
@@ -467,7 +514,7 @@ def _safe_completed_session(path: Path, protected: set[Path]) -> bool:
         and not path.is_symlink()
         and stat.S_ISDIR(info.st_mode)
         and info.st_uid == os.getuid()
-        and meta.ended_at is not None
+        and (meta.ended_at is not None or _is_orphaned_session(path))
     )
 
 
@@ -623,7 +670,12 @@ class SessionWriter:
             meta.dropped_crashes,
         )
         self.meta.storage_limit_bytes = session_limit
+        self._global_cap_retry_at = 0.0
         self._log = (self.dir / "log.jsonl").open("a", encoding="utf-8")
+        # Liveness marker for session_writer_is_live(); released by the kernel
+        # if this process dies without close().
+        with contextlib.suppress(OSError):
+            fcntl.flock(self._log.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             self._raw = (self.dir / "raw.log").open("ab")
         except BaseException:
@@ -867,14 +919,26 @@ class SessionWriter:
         """
         if amount <= 0:
             return None
+        retrying_global_cap = False
         if log_data and self.meta.storage_capped:
-            return self.meta.storage_cap_reason or "session_limit"
+            reason = self.meta.storage_cap_reason or "session_limit"
+            # A session cap is final. A global cap is not: another session may
+            # have completed since, and pruning it frees space.
+            if reason != "global_limit" or time.monotonic() < self._global_cap_retry_at:
+                return reason
+            retrying_global_cap = True
         if log_data and self._log_bytes + amount > self._log_limit:
             return "session_limit"
         if self._session_data_bytes + amount > self._session_limit:
             return "session_limit"
         if self._global_allowance < amount and not self._refill_allowance(amount):
+            self._global_cap_retry_at = time.monotonic() + GLOBAL_CAP_RETRY_SECONDS
             return "global_limit"
+        if retrying_global_cap:
+            # Writing again. The drop counters stay as the record of the gap.
+            self.meta.storage_capped = False
+            self.meta.storage_cap_reason = None
+            self._write_meta_unlocked()
 
         self._global_allowance -= amount
         self._session_data_bytes += amount

@@ -46,7 +46,12 @@ reserves bounded crash capacity; once ordinary logs reach their allowance it
 keeps the port alive but drops further raw/structured writes and checkpoints
 counters in metadata. Global pruning considers only regular files below the
 owner-controlled root, deletes aged unreferenced direct-child ELF archives first,
-and then removes oldest completed sessions. Active sessions, corrupt/uncertain
+and then removes oldest completed sessions. Each writer holds an exclusive lock
+on its `log.jsonl` for its whole life; the kernel drops that lock if the process
+dies. A session with no end time, no lock holder and no write for one hour is
+an interrupted session and is pruned like a completed one. A global-limit cap
+is temporary: the writer retries every 15 seconds and resumes when pruning
+frees space, while the per-session cap is final. Active sessions, corrupt/uncertain
 references, symlinks, newly archived in-flight ELFs, and anything outside those
 validated roots fail closed.
 
@@ -73,9 +78,9 @@ stopped and its ownership is verified.
 
 ## Crash pipeline
 
-1. **Detect** — a signature regex (Guru Meditation, watchdogs, `abort()`, heap corruption, brownout…) flags the start line.
-2. **Assemble** — subsequent lines (register dump, `Backtrace:`) are collected into one artifact, ended by the reboot marker or a line budget. Port loss mid-crash flushes the partial artifact instead of dropping it.
-3. **Decode** — backtrace program counters are symbolized in a background worker with `addr2line` (ESP toolchain binaries preferred) against the archived ELF for that exact firmware generation, so capture does not stall while the device reboots. An unresolved crash is never carried forward to a later generation.
+1. **Detect** — a signature regex (Guru Meditation, watchdogs, `abort()`, heap corruption, brownout…) flags the start line. A formatted log line at info, debug or verbose level is routine output and never starts an artifact.
+2. **Assemble** — subsequent lines (register dump, `Backtrace:`) are collected into one artifact, ended by the reboot marker, a line budget, or two seconds of silence. The silence rule publishes the crash of a device that halts after a panic, and of a task watchdog that does not reset the chip. Port loss mid-crash flushes the partial artifact instead of dropping it. Addresses come from every `Backtrace:` line; when there is none (RISC-V targets print only a register dump) the program counter and return address stand in.
+3. **Decode** — backtrace program counters are symbolized in a background worker with `addr2line` against the archived ELF for that exact firmware generation, so capture does not stall while the device reboots. The ELF header selects the tool: an Xtensa, RISC-V or ARM image uses only its own toolchain, found on `PATH` or in the private toolchain directories of PlatformIO, ESP-IDF, Arduino and the Zephyr SDK. A tool for the wrong architecture is never tried, because it prints nothing useful. An unresolved crash is never carried forward to a later generation.
 
 ELF archiving happens in `hwlog flash`: a backtrace is only symbolizable against the exact build that produced it, so every flash attempt retires the prior association. The wrapper archives a content-hashed candidate only when one changed artifact can be identified unambiguously, or when a known upload tool has one unchanged candidate whose content matches the prior archive. Registration carries the firmware generation, preventing delayed work from attaching stale symbols to a later flash. This is conservative, best-effort provenance: a generic flasher does not report which artifact it actually programmed, so an ambiguous build leaves symbolization pending instead of guessing.
 

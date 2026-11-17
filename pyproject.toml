@@ -1,6 +1,6 @@
 [project]
 name = "hardware-logging"
-version = "0.1.0"
+version = "0.2.0"
 description = "Structured, crash-aware serial log capture for embedded boards, built for AI coding agents. Persistent sessions, bounded queries, decoded backtraces, MCP server."
 readme = "README.md"
 license = "MIT"

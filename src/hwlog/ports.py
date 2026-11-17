@@ -113,14 +113,22 @@ def resolve_port(spec: str | None = None) -> Board | None:
     """Resolve a port spec to a live Board.
 
     - None: best candidate (first known-VID board, else first USB serial port).
-    - Exact device path, or substring match (``usbmodem`` matches the renumbered
-      sibling after a replug).
+    - Exact device path, exact device name, or substring match (``usbmodem``
+      matches the renumbered sibling after a replug). An exact name wins over a
+      substring, so ``ttyUSB1`` never collides with ``ttyUSB10``.
     """
     boards = discover()
     if spec:
+        exact = {spec}
+        if spec.startswith("/dev/tty."):
+            # macOS exposes each port twice; discovery lists the call-out name.
+            exact.add("/dev/cu." + spec[len("/dev/tty.") :])
         for b in boards:
-            if b.device == spec:
+            if b.device in exact:
                 return b
+        named = [b for b in boards if b.device.rsplit("/", 1)[-1] == spec]
+        if len(named) == 1:
+            return named[0]
         matches = [b for b in boards if spec in b.device]
         matches.sort(key=lambda b: not b.is_known)
         if len(matches) > 1:

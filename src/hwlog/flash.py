@@ -40,6 +40,7 @@ from .session import (
 
 ELF_SEARCH_GLOBS = (
     "build/*.elf",  # ESP-IDF
+    "build/zephyr/zephyr.elf",  # Zephyr / nRF Connect SDK (west build)
     ".pio/build/*/*.elf",  # PlatformIO
     "**/*.ino.elf",  # arduino-cli export/build dirs
     "*.elf",
@@ -605,6 +606,9 @@ def run_flash(command: list[str], port_spec: str | None = None, cwd: Path | None
                 paused[id(affected)]["firmware_may_have_changed"] = True
             proc = subprocess.run(command, cwd=root, check=False)
             code = proc.returncode
+            if code < 0:
+                # Killed by a signal: report it as a shell does (128 + signal).
+                code = 128 - code
 
             if state:
                 with contextlib.suppress(OSError, daemon.DaemonError):
@@ -634,6 +638,8 @@ def run_flash(command: list[str], port_spec: str | None = None, cwd: Path | None
                     "idf.py",
                     "pio",
                     "platformio",
+                    "west",
+                    "arduino-cli",
                 }
             ):
                 candidate = find_recent_elf(root, since_ts=0)

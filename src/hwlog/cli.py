@@ -22,7 +22,13 @@ from .capture import CaptureLoop
 from .parsers import strip_ansi
 from .records import SessionMeta, now_iso
 from .safety import MAX_WAIT_SECONDS, PatternError
-from .session import SessionWriter, list_sessions, read_meta, resolve_session
+from .session import (
+    SessionWriter,
+    list_sessions,
+    read_meta,
+    resolve_session,
+    session_writer_is_live,
+)
 
 app = typer.Typer(
     name="hwlog",
@@ -288,9 +294,13 @@ def status(json_out: bool = typer.Option(False, "--json")) -> None:
 @app.command()
 def logs(
     tail: int = typer.Option(query.DEFAULT_TAIL, "--tail", "-n", help="Max lines returned"),
-    boot: int | None = typer.Option(None, "--boot", help="Boot index; -1 = latest boot"),
+    boot: int | None = typer.Option(
+        None, "--boot", help="Boot index; -1 = latest boot, -2 = the boot before it"
+    ),
     level: str | None = typer.Option(None, "--level", "-l", help="Min severity: E, W, I, D, V"),
-    grep: str | None = typer.Option(None, "--grep", "-g", help="Substring filter"),
+    grep: str | None = typer.Option(
+        None, "--grep", "-g", help="Substring of the message or of `tag: message`"
+    ),
     tag: str | None = typer.Option(None, "--tag", help="Exact tag filter"),
     since: str | None = typer.Option(None, "--since", help="ISO timestamp lower bound"),
     session: str | None = typer.Option(None, "--session", "-s"),
@@ -321,7 +331,7 @@ def logs(
             _fail("since must be a timezone-aware ISO-8601 timestamp")
     s = _session_or_fail(session)
     budget = _scan_budget(scan_bytes)
-    b = query.latest_boot(s, max_bytes=budget) if boot == -1 else boot
+    b = query.resolve_boot(s, boot, max_bytes=budget)
     recs = query.filter_records(
         query.iter_records(s, max_bytes=budget),
         boot=b,
@@ -455,20 +465,34 @@ def wait(
     from_start: bool = typer.Option(
         False, "--from-start", help="Scan existing records too, not just new output"
     ),
+    fail_on_crash: bool = typer.Option(
+        False, "--fail-on-crash", help="Stop with exit code 3 when a crash is recorded first"
+    ),
 ) -> None:
     """Behavioral assertion: block until PATTERN appears in device output.
 
-    Exit 0 = matched (prints the matching record), 1 = timeout. "It flashed"
-    is not "it works" — gate your loop on observed behavior.
+    Exit 0 = matched (prints the matching record), 1 = timeout, 3 = a crash
+    was recorded first (with --fail-on-crash). "It flashed" is not "it works" —
+    gate your loop on observed behavior.
     """
     s = _session_or_fail(session)
     try:
-        rec = query.wait_for_record(s, pattern, timeout, from_start=from_start)
+        outcome = query.wait_for_outcome(
+            s, pattern, timeout, from_start=from_start, stop_on_crash=fail_on_crash
+        )
     except (PatternError, ValueError) as exc:
         _fail(str(exc))
-    if rec is not None:
-        typer.echo(query.format_record(rec))
+    if outcome.reason == "matched":
+        typer.echo(query.format_record(outcome.record))
         raise typer.Exit(0)
+    if outcome.reason == "crash":
+        typer.echo(query.format_record(outcome.record), err=True)
+        typer.echo(
+            f"crash recorded before /{strip_ansi(pattern)}/ — inspect it with "
+            "`hwlog crashes --last`",
+            err=True,
+        )
+        raise typer.Exit(3)
     bounded = min(timeout, MAX_WAIT_SECONDS)
     typer.echo(f"timeout after {bounded}s waiting for /{strip_ansi(pattern)}/", err=True)
     raise typer.Exit(1)
@@ -516,9 +540,14 @@ def sessions(json_out: bool = typer.Option(False, "--json")) -> None:
                     f"dropped {meta.dropped_raw_bytes}B/{meta.dropped_records} records/"
                     f"{meta.dropped_crashes} crashes]"
                 )
+            state = ""
+            if not meta.ended_at:
+                # No end time: still capturing, or the writer died before close().
+                live = session_writer_is_live(p)
+                state = "  (interrupted)" if live is False else "  (active)"
             typer.echo(
                 f"{strip_ansi(meta.session_id)}  port={strip_ansi(meta.port)} boots={meta.boots} "
-                f"crashes={meta.crashes}{'' if meta.ended_at else '  (active)'}{storage}"
+                f"crashes={meta.crashes}{state}{storage}"
             )
 
 

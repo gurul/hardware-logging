@@ -13,14 +13,17 @@ A decoded backtrace is worth ten thousand raw log lines. This module:
 from __future__ import annotations
 
 import contextlib
+import glob
 import os
 import re
 import selectors
 import shutil
 import signal
+import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Battle-tested signature set (each pattern earned its place in a real incident).
 CRASH_RE = re.compile(
@@ -44,6 +47,16 @@ CRASH_START_RE = re.compile(
 
 BACKTRACE_RE = re.compile(r"Backtrace:\s*((?:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+\s*)+)")
 ADDR_PAIR_RE = re.compile(r"(0x[0-9a-fA-F]+):0x[0-9a-fA-F]+")
+
+# Register-dump program counters. RISC-V panics (ESP32-C3/C6/H2) print no
+# "Backtrace:" line, and a corrupted Xtensa stack can lose it. The faulting PC
+# and the return address still name the failing function and its caller.
+REGISTER_PC_RE = re.compile(r"(?<![A-Za-z0-9_])(MEPC|RA|PC)\s*:\s*(0x[0-9a-fA-F]{8})\b")
+_REGISTER_PC_ORDER = ("MEPC", "PC", "RA")
+
+# Formatted log lines at these levels are routine output. A panic handler
+# prints unformatted text, and IDF reports watchdogs at error level.
+_ROUTINE_LEVELS = frozenset({"I", "D", "V"})
 
 # End-of-artifact markers: the chip reboots after a panic.
 CRASH_END_RE = re.compile(r"^Rebooting\.\.\.|^ELF file SHA256:|^rst:0x")
@@ -98,16 +111,22 @@ class CrashAssembler:
     def in_crash(self) -> bool:
         return self._active is not None
 
-    def feed(self, line: str) -> CrashReport | None:
+    def feed(self, line: str, level: str | None = None) -> CrashReport | None:
+        """Add one line. ``level`` is the parsed severity of a formatted log line.
+
+        An info, debug or verbose line never starts an artifact: firmware that
+        logs "watchdog timeout set to 5 s" has not crashed.
+        """
+        starts_crash = level not in _ROUTINE_LEVELS and bool(CRASH_START_RE.search(line))
         if self._active is None:
-            if CRASH_START_RE.search(line):
+            if starts_crash:
                 self._count += 1
                 self._active = CrashReport(crash_id=self._count, first_line=line, lines=[line])
             return None
 
         report = self._active
         # A new crash start while assembling means the previous artifact ended abruptly.
-        if CRASH_START_RE.search(line) and len(report.lines) > 1:
+        if starts_crash and len(report.lines) > 1:
             finished = self._finish()
             self._active = CrashReport(crash_id=self._count + 1, first_line=line, lines=[line])
             self._count += 1
@@ -130,30 +149,117 @@ class CrashAssembler:
         report = self._active
         assert report is not None
         self._active = None
-        for line in report.lines:
-            m = BACKTRACE_RE.search(line)
-            if m:
-                report.backtrace_addrs = ADDR_PAIR_RE.findall(m.group(0))
+        report.backtrace_addrs = extract_backtrace_addrs(report.lines)
         return report
+
+
+def extract_backtrace_addrs(lines: list[str]) -> list[str]:
+    """Program counters worth symbolizing, in call order, without duplicates.
+
+    Every ``Backtrace:`` line contributes: a watchdog dump prints one per
+    core. With no backtrace line, use the register-dump program counter and
+    return address.
+    """
+    addrs: list[str] = []
+    for line in lines:
+        m = BACKTRACE_RE.search(line)
+        if m:
+            addrs.extend(ADDR_PAIR_RE.findall(m.group(0)))
+    if not addrs:
+        registers: dict[str, str] = {}
+        for line in lines:
+            for name, value in REGISTER_PC_RE.findall(line):
+                registers.setdefault(name, value)
+        addrs = [registers[name] for name in _REGISTER_PC_ORDER if name in registers]
+    unique = list(dict.fromkeys(addrs))
+    return unique[:MAX_BACKTRACE_ADDRS]
 
 
 # --- Symbolization ---------------------------------------------------------
 
-# Try target-specific toolchains first, then generic binutils.
-ADDR2LINE_CANDIDATES = (
+# Target-specific toolchains first, then generic binutils. A tool for the
+# wrong architecture prints nothing useful, so the ELF header decides the set.
+_XTENSA_TOOLS = (
     "xtensa-esp32s3-elf-addr2line",
     "xtensa-esp32-elf-addr2line",
+    "xtensa-esp32s2-elf-addr2line",
     "xtensa-esp-elf-addr2line",
-    "riscv32-esp-elf-addr2line",
-    "addr2line",
 )
+_RISCV_TOOLS = ("riscv32-esp-elf-addr2line", "riscv-none-elf-addr2line")
+_ARM_TOOLS = ("arm-none-eabi-addr2line", "arm-zephyr-eabi-addr2line")
+_GENERIC_TOOLS = ("addr2line", "llvm-addr2line")
+ADDR2LINE_CANDIDATES = (*_XTENSA_TOOLS, *_RISCV_TOOLS, *_ARM_TOOLS, *_GENERIC_TOOLS)
+
+# ELF e_machine values.
+_EM_ARM, _EM_XTENSA, _EM_RISCV = 40, 94, 243
+_TOOLS_BY_MACHINE = {
+    _EM_XTENSA: _XTENSA_TOOLS,
+    _EM_RISCV: _RISCV_TOOLS,
+    _EM_ARM: _ARM_TOOLS,
+}
+
+# Toolchains that IDEs install outside PATH. PlatformIO, the ESP-IDF installer
+# and the Arduino boards manager all keep a private copy under the home
+# directory, so a user who never exported a toolchain can still decode.
+_TOOLCHAIN_BIN_GLOBS = (
+    ".platformio/packages/toolchain-*/bin",
+    ".espressif/tools/*/*/*/bin",
+    "Library/Arduino15/packages/*/tools/*/*/bin",
+    ".arduino15/packages/*/tools/*/*/bin",
+    "zephyr-sdk-*/*/bin",
+)
+MAX_TOOLCHAIN_DIRS = 256
 
 
-def find_addr2line() -> str | None:
-    for name in ADDR2LINE_CANDIDATES:
+def elf_machine(elf_path: str) -> int | None:
+    """Read ``e_machine`` from an ELF header; None when the file is not an ELF."""
+    try:
+        with open(elf_path, "rb") as stream:
+            header = stream.read(20)
+    except OSError:
+        return None
+    if len(header) < 20 or header[:4] != b"\x7fELF" or header[5] not in (1, 2):
+        return None
+    return struct.unpack_from("<H" if header[5] == 1 else ">H", header, 18)[0]
+
+
+def toolchain_bin_dirs() -> list[str]:
+    """Known private toolchain directories under the home directory, newest name first."""
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        return []
+    found: list[str] = []
+    for pattern in _TOOLCHAIN_BIN_GLOBS:
+        matches = sorted(glob.glob(str(home / pattern)), reverse=True)
+        found.extend(path for path in matches if os.path.isdir(path))
+        if len(found) >= MAX_TOOLCHAIN_DIRS:
+            break
+    return found[:MAX_TOOLCHAIN_DIRS]
+
+
+def addr2line_names(elf_path: str | None = None) -> tuple[str, ...]:
+    """Candidate tool names, most specific first, for one ELF (or for any)."""
+    machine = elf_machine(elf_path) if elf_path else None
+    specific = _TOOLS_BY_MACHINE.get(machine)
+    if specific is None:
+        return ADDR2LINE_CANDIDATES
+    return (*specific, *_GENERIC_TOOLS)
+
+
+def find_addr2line(elf_path: str | None = None) -> str | None:
+    """Locate addr2line for ``elf_path``: PATH first, then private toolchains."""
+    names = addr2line_names(elf_path)
+    for name in names:
         path = shutil.which(name)
         if path:
             return path
+    extra = os.pathsep.join(toolchain_bin_dirs())
+    if extra:
+        for name in names:
+            path = shutil.which(name, path=extra)
+            if path:
+                return path
     return None
 
 

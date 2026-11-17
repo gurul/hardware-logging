@@ -23,7 +23,7 @@ hwlog ports --match raspberry --serial E661410403123456
 Print the versioned JSON capability manifest shared with MCP `describe_capabilities`: observations, device-discovery filters, event names, limits, and write policy. `writes.mcp_enabled` reflects this process's environment; the MCP server must have its own `HWLOG_MCP_ALLOW_SEND=1` opt-in. CLI `send` is independent of that MCP opt-in. No capture session is required. This describes hwlog's interface, not a connected board's command vocabulary or an MHS-compatible manifest.
 
 ### `hwlog start [--port SPEC] [--baud N]`
-Start the background capture daemon. `--port` accepts an exact path or a substring (`usbmodem` survives replug renumbering, matched case-insensitively against the normalized port name); omitted, the best board candidate is auto-detected. Idempotent for the same selection — repeating it returns the existing daemon. Mixing selection modes is refused in both directions: an explicit `--port` will not start alongside a running auto-select daemon, and auto-select will not silently adopt a running explicit-port daemon.
+Start the background capture daemon. `--port` accepts an exact path, an exact device name (`ttyUSB1` selects `/dev/ttyUSB1`, never `/dev/ttyUSB10`) or a substring (`usbmodem` survives replug renumbering, matched case-insensitively against the normalized port name). On macOS a `/dev/tty.*` path selects its `/dev/cu.*` twin; omitted, the best board candidate is auto-detected. Idempotent for the same selection — repeating it returns the existing daemon. Mixing selection modes is refused in both directions: an explicit `--port` will not start alongside a running auto-select daemon, and auto-select will not silently adopt a running explicit-port daemon.
 
 After upgrading from a release with the older unauthenticated daemon protocol, live legacy state is preserved and new capture refuses to start alongside it. Stop that process with the previous `hwlog` version, or verify the recorded PID before terminating it manually. State left by a provably dead legacy daemon is cleaned up automatically.
 
@@ -59,9 +59,9 @@ Bounded log query over the current (or `--session`) session.
 | Option | Meaning |
 |---|---|
 | `--tail/-n N` | max lines returned (default 100; hard ceiling 500) |
-| `--boot N` | only boot cycle N; `-1` = latest boot |
+| `--boot N` | only boot cycle N; negative values count back from the latest boot in the scanned window: `-1` = latest, `-2` = the boot before it |
 | `--level/-l L` | min severity — `E` errors only, `W` = E+W, then `I`, `D`, `V` |
-| `--grep/-g STR` | case-insensitive substring on message |
+| `--grep/-g STR` | case-insensitive substring of the message, or of `tag: message` as a serial monitor prints it |
 | `--tag STR` | exact tag match |
 | `--since ISO` | timestamp lower bound |
 | `--no-collapse` | keep repeated log records instead of `msg (×N)` |
@@ -89,9 +89,14 @@ newest 500 boot rows.
 ### `hwlog crashes [--last] [--json]`
 List up to the newest 500 crash summaries. With `--json`, the list is summary NDJSON rather than repeated full artifacts. `--last` prints the one most recent full artifact — raw panic lines plus the `addr2line`-decoded backtrace when an ELF was archived.
 
+A crash is published when its reboot marker arrives, when the artifact reaches its line budget, or after two seconds of silence. The last case covers a device that halts after a panic and a task watchdog that does not reset the chip. Addresses come from every `Backtrace:` line (a watchdog prints one per core). Without a backtrace line, as on RISC-V targets, hwlog uses the register dump's program counter and return address. A formatted log line at info, debug or verbose level never starts a crash.
+
+The `addr2line` binary is chosen from the ELF header: Xtensa, RISC-V and ARM images each use their own toolchain. hwlog searches `PATH`, then `~/.platformio/packages`, `~/.espressif/tools`, the Arduino15 package directory and `~/zephyr-sdk-*`.
+
 ### `hwlog sessions [--json]`
 All retained sessions, oldest first. Capped sessions include their reason and
-drop counters.
+drop counters. A session with no end time shows `(active)` while its capture
+process holds it, and `(interrupted)` when that process died without closing it.
 
 ## Storage limits
 
@@ -100,14 +105,17 @@ drop counters.
 bytes; zero disables further data growth. A small part of the session budget is
 reserved for bounded crash artifacts. On the global limit, hwlog first removes
 aged unreferenced files directly inside its ELF archive, then the oldest completed
-sessions. It never prunes active sessions or follows symlinks outside
+sessions. An interrupted session counts as completed one hour after its last
+write. A session that reached the global limit resumes writing when pruning
+frees space; it checks at most every 15 seconds, and its drop counters keep the
+size of the gap. The per-session limit is final. hwlog never prunes active sessions or follows symlinks outside
 `HWLOG_DIR`; a newly archived ELF receives a grace period so concurrent
 registration cannot be mistaken for stale data.
 
 ## Act
 
 ### `hwlog flash [--port SPEC] -- <command...>`
-Run any flash command under an exclusive pause lease, then conservatively discover and archive at most one ELF candidate for backtrace symbolization. Multiple concurrent wrappers are rejected. Every attempted command invalidates the previous firmware/ELF association, including a nonzero exit because the device may have been partially programmed. A successful ESP-IDF or PlatformIO upload may reuse an unchanged ELF only when its content exactly matches the last archive; otherwise, if no candidate can be identified without ambiguity, the new generation remains unassociated and crashes stay undecoded. Generic flash commands do not expose which binary they programmed, so automatic ELF discovery is best-effort provenance rather than proof that the selected artifact reached the device. Exit code = the flash command's exit code.
+Run any flash command under an exclusive pause lease, then conservatively discover and archive at most one ELF candidate for backtrace symbolization. Multiple concurrent wrappers are rejected. Every attempted command invalidates the previous firmware/ELF association, including a nonzero exit because the device may have been partially programmed. A successful ESP-IDF, PlatformIO, west or arduino-cli upload may reuse an unchanged ELF only when its content exactly matches the last archive; otherwise, if no candidate can be identified without ambiguity, the new generation remains unassociated and crashes stay undecoded. Generic flash commands do not expose which binary they programmed, so automatic ELF discovery is best-effort provenance rather than proof that the selected artifact reached the device. Exit code = the flash command's exit code; a flasher killed by a signal reports 128 plus the signal number, as a shell does.
 
 Capture resumes when the wrapped process exits, with the target daemon resumed before unrelated captures. Output emitted while the flash tool still owns the port—including firmware output during tool-side cleanup before exit—cannot be recorded.
 
@@ -116,12 +124,15 @@ wrapped command. Give both tools the same target when flashing an explicit board
 
 ```bash
 hwlog flash --port /dev/cu.usbmodem101 -- idf.py -p /dev/cu.usbmodem101 flash
-hwlog flash -- arduino-cli upload --fqbn esp32:esp32:esp32s3 .
+hwlog flash -- arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path build --upload .
 hwlog flash -- pio run -t upload
+hwlog flash -- west flash
 ```
 
-### `hwlog wait --pattern REGEX [--timeout S] [--from-start]`
-Block until the pattern appears in device output. Exit 0 = matched (record printed), 1 = timeout, 2 = invalid input/no session. By default a post-flash wait starts at the latest flash boundary, so output captured after resume but before `wait` starts still counts; without a boundary it starts at the invocation-time end of the log. `--from-start` scans the existing session too. Patterns are limited to 512 characters, each match has an execution timeout, and waits are capped at 120 seconds.
+ELF discovery looks inside the project directory only: `build/*.elf`, `build/zephyr/zephyr.elf`, `.pio/build/*/*.elf`, `**/*.ino.elf` and `*.elf`. arduino-cli builds in a cache directory outside the project by default, so give it `--build-path build` (or `--export-binaries`); a bare `arduino-cli upload` leaves the crash undecoded.
+
+### `hwlog wait --pattern REGEX [--timeout S] [--from-start] [--fail-on-crash]`
+Block until the pattern appears in device output. Exit 0 = matched (record printed), 1 = timeout, 2 = invalid input/no session, 3 = a crash was recorded before the pattern (only with `--fail-on-crash`; the crash record goes to stderr). The pattern is tried against each record's message and against its `tag: message` text, so a line copied from a serial monitor matches. Records are judged in capture order: a match that precedes a crash still exits 0. By default a post-flash wait starts at the latest flash boundary, so output captured after resume but before `wait` starts still counts; without a boundary it starts at the invocation-time end of the log. `--from-start` scans the existing session too. Patterns are limited to 512 characters, each match has an execution timeout, and waits are capped at 120 seconds.
 
 The follower retains incomplete lines between reads. If the log file is replaced
 or shrinks below its read offset, it resets to the beginning and discards partial

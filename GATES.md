@@ -1,26 +1,39 @@
-# Gates: README and code improvements
+# Gates: crash pipeline and agent-loop improvements
 
-OWNS: src/hwlog/**, tests/**, docs/**, README.md, pyproject.toml, GATES.md
+OWNS: src/hwlog/**, tests/**, docs/**, README.md, pyproject.toml, uv.lock, GATES.md
 
-Scope: Improve evidenced code defects and onboarding documentation, verify the changes, and publish them to main.
+Scope: Fix reproduced crash-pipeline defects, make `wait` and boot selection fit the agent loop, triage the reviewer findings, update the docs, and publish to main.
 
-- [x] G1: Query regressions preserve boot/lifecycle evidence, avoid input mutation, and recover replaced logs in CLI/MCP workflows.
-  CHECK: uv run pytest -q tests/test_query.py tests/test_summary.py tests/test_discovery.py
-  EXPECT: passed
-  EVIDENCE: exit=0; EXPECT=matched; query/summary/discovery regression run passed. Full-suite JUnit independently records 22 query, 14 summary and 16 discovery tests with zero failures, errors or skips (52 total).
+- [x] G1: Crash assembly emits a halted or watchdog crash after an idle period, keeps every backtrace line, falls back to register program counters, and ignores info-level lookalikes.
+  CHECK: uv run pytest -q tests/test_crash_pipeline.py
+  EXPECT: /\d+ passed/
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=<repo>; path=0f6284dab85b/18 entries; output=........                                                                 [100%] | 8 passed in 1.08s
 
-- [x] G2: README and affected documentation match the implemented installation, commands, and limitations.
-  EVIDENCE: Manually reviewed README.md and docs/{cli,mcp,agent-workflow}.md against cli.py, mcp_server.py, records.py, query.py, summary.py and storage defaults. Isolated `uv tool install .` succeeded in /tmp/hwlog-readme-install.7EPQkQ; its `hwlog version` returned 0.1.0, `describe` returned schema version 1 with the documented limits, and `init` installed the packaged skill and printed the snippet. Local Markdown links resolve. Examples target both capture and flasher, explain session selection and wait exit/boundary behavior, and distinguish observed output from hardware health. No physical-board validation was performed.
+- [x] G2: addr2line selection follows the ELF architecture and finds PlatformIO, ESP-IDF and Arduino toolchains that are not on PATH.
+  CHECK: uv run pytest -q tests/test_addr2line.py
+  EXPECT: /\d+ passed/
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=<repo>; path=0f6284dab85b/18 entries; output=.......                                                                  [100%] | 7 passed in 0.03s
 
-- [x] G3: Repository lint, formatting, tests, and distribution build pass.
-  CHECK: uv run ruff check . && uv run ruff format --check . && uv run pytest -q --junitxml=.pytest_cache/results.xml && uv build --no-sources --no-build-isolation
+- [x] G3: `wait` and `--grep` match the `tag: message` rendering, and `wait --fail-on-crash` returns exit code 3 with the crash record in CLI and MCP.
+  CHECK: uv run pytest -q tests/test_wait_crash.py
+  EXPECT: /\d+ passed/
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=<repo>; path=0f6284dab85b/18 entries; output=........                                                                 [100%] | 8 passed in 1.16s
+
+- [x] G4: Negative boot selectors count back from the latest boot in CLI and MCP.
+  CHECK: uv run pytest -q tests/test_relative_boot.py
+  EXPECT: /\d+ passed/
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=<repo>; path=0f6284dab85b/18 entries; output=...                                                                      [100%] | 3 passed in 0.35s
+
+- [x] G5: Repository lint, formatting, full test suite and distribution build pass.
+  CHECK: uv run ruff check . && uv run ruff format --check . && uv run pytest -q && uv build --no-sources --no-build-isolation
   EXPECT: Successfully built
-  EVIDENCE: exit=0 for lint, formatting, full suite and build; JUnit measured 226 tests, 0 failures, 0 errors and 0 skips. Successfully built dist/hardware_logging-0.1.0.tar.gz and dist/hardware_logging-0.1.0-py3-none-any.whl; rebuilt after the final workflow-guide edit.
+  EVIDENCE: exit=0; shell=/bin/sh; cwd=<repo>; path=0f6284dab85b/18 entries; output=Successfully built dist/hardware_logging-0.2.0.tar.gz | Successfully built dist/hardware_logging-0.2.0-py3-none-any.whl
 
-- [x] G4: Research notes cite verified primary papers and map findings to implemented behavior with explicit limitations.
-  EVIDENCE: Independently reviewed the research leaf and primary full-text passages: Dapper sections 2.1/4.4, GTSO sections 2/4, Log20 sections 1/7, and Observing a Moving Target sections III/IV. Verified metadata, identity/sampling, clock-order, profile-coverage and transport/energy claims. docs/research-notes.md gives findings, engineering applications and limits for all four papers; README, CLI and MCP docs link it. Parent `--reverify --root . --cwd .` reran the research structure check successfully (3 research gates met). No claim that the papers validate hwlog performance or hardware correctness.
+- [x] G6: A real firmware ELF on this machine decodes through the auto-discovered PlatformIO toolchain with no addr2line on PATH.
+  EVIDENCE: 2026-11-17, macOS arm64. `shutil.which` found none of the candidate names on PATH. For an archived ESP32-S3 Arduino firmware ELF, `elf_machine` returned 94 (Xtensa) and `find_addr2line` selected `~/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-addr2line`. `decode_backtrace([0x4200a6ac], elf)` with no tool argument returned one frame, `0x4200a6ac: app_main at .../cores/esp32/main.cpp:89`; the address came from the toolchain's `nm` output for `app_main`. No RISC-V or ARM firmware ELF was available, so those two architectures are covered by header-level tests only. No physical board was attached.
 
-- [x] G5: Source and wheel distributions retain package code and agent assets while excluding local research downloads and verification state.
-  CHECK: uv run python -c 'from pathlib import Path; import tarfile,zipfile; a=tarfile.open("dist/hardware_logging-0.1.0.tar.gz"); names=a.getnames(); prefix="hardware_logging-0.1.0/"; bad=[p for p in names if "/.firecrawl/" in p or "/.unlazy/" in p]; assert not bad,bad; files=["src/hwlog/query.py","src/hwlog/assets/SKILL.md","README.md","docs/research-notes.md","docs/agent-workflow.md","pyproject.toml"]; assert all(a.extractfile(prefix+p).read()==Path(p).read_bytes() for p in files); w=zipfile.ZipFile("dist/hardware_logging-0.1.0-py3-none-any.whl"); assert w.read("hwlog/query.py")==Path("src/hwlog/query.py").read_bytes(); assert w.read("hwlog/assets/SKILL.md")==Path("src/hwlog/assets/SKILL.md").read_bytes(); assert not any(p.startswith((".firecrawl/",".unlazy/")) for p in w.namelist()); print("distribution contents verified")'
-  EXPECT: distribution contents verified
-  EVIDENCE: exit=0; shell=/bin/sh; cwd=/Users/gurucharan/Documents/personal/hardware-logging; path=892706188a42/24 entries; output=distribution contents verified
+- [x] G7: README, CLI reference, MCP reference, architecture notes and the bundled skill describe the new behavior and contain no false statement about it.
+  EVIDENCE: Reviewed README.md, docs/{cli,mcp,architecture}.md and src/hwlog/assets/SKILL.md against the changed code. Each stated value was read from its constant: idle publication 2 s (`CRASH_IDLE_FLUSH_S`), orphan grace one hour (`ORPHAN_SESSION_GRACE_SECONDS`), cap retry 15 s (`GLOBAL_CAP_RETRY_SECONDS`), toolchain directories (`_TOOLCHAIN_BIN_GLOBS`), ELF globs (`ELF_SEARCH_GLOBS`), exit code 3 and the unchanged-ELF tool set. `hwlog wait --help` and `hwlog logs --help` show `--fail-on-crash`, the exit codes and the negative boot selector; `hwlog version` prints 0.2.0. The arduino-cli example now uses `compile --build-path build --upload`; that command line was not run against a board.
+
+- [x] G8: Every reviewer finding on daemon, session and flash code is either fixed with a regression test or listed as declined with a reason.
+  EVIDENCE: Fixed, each with tests in tests/test_storage_recovery.py or tests/test_review_fixes.py: (1) a session whose writer died is prunable after the grace period; (2) a global-limit cap lifts when space frees; (3) nested-repeat validator bypasses (`[](]` classes, verbose mode behind other flag letters) and the `{,N}` form; (4) Zephyr `build/zephyr/zephyr.elf` discovery; (5) signal-killed flasher exit code; (6) exact device-name and macOS `tty.` port matching; (7) arduino-cli and west join the unchanged-ELF set and the arduino-cli doc example builds inside the project. Negative control: 22 of the new tests fail against the pre-change source, and the pre-change validator accepts all four bypass patterns. Declined: (a) a live daemon whose control-socket file disappears becomes unreachable and blocks new captures (daemon.py `_read_valid_state`). Reproduced by the reviewer with a simulated state; the real-world trigger is unverified and the fix changes the authenticated control path, so it is left open. (b) `update_crash` can reserve quota after the writer closes; not reproduced, and the next disk reconcile corrects the counter.

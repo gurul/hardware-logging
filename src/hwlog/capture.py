@@ -37,6 +37,10 @@ from .records import Event, LogRecord, now_iso
 from .session import SessionWriter, base_dir, ensure_private_dir, port_slug
 
 BOOT_DEBOUNCE_S = 3.0  # ROM emits several marker lines per reset; count once
+# A panic handler prints its dump in one burst. Silence this long after the
+# last crash line means the device halted or kept running without a reboot
+# marker; publish the artifact instead of holding it until the port closes.
+CRASH_IDLE_FLUSH_S = 2.0
 REOPEN_BACKOFF_S = (1.0, 2.0, 5.0, 10.0, 15.0)  # then stay at 15s
 MAX_STRUCTURED_LINE_BYTES = 8192
 MAX_SEND_BYTES = 4096
@@ -88,6 +92,8 @@ class CaptureLoop:
         self._crash = CrashAssembler()
         self._boot = 0
         self._last_boot_mark = 0.0
+        self._last_crash_line = 0.0
+        self._addr2line_cache: dict[str, str | None] = {}
         self._ser: serial.Serial | None = None
         self._buf = b""
         self._usb_serial: str | None = writer.meta.usb_serial
@@ -237,6 +243,7 @@ class CaptureLoop:
                     self.writer.write_raw(data)
                     self._buf += data
                     self._drain_lines()
+                self._flush_idle_crash()
         finally:
             try:
                 self._close_port(reason="capture stopped")
@@ -503,6 +510,13 @@ class CaptureLoop:
         if report is not None:
             self._emit_crash(report)
 
+    def _flush_idle_crash(self) -> None:
+        """Publish a crash whose device went quiet without a reboot marker."""
+        if self._crash.in_crash and time.monotonic() - self._last_crash_line >= CRASH_IDLE_FLUSH_S:
+            report = self._crash.flush()
+            if report is not None:
+                self._emit_crash(report)
+
     def _drain_lines(self) -> None:
         while b"\n" in self._buf:
             raw, self._buf = self._buf.split(b"\n", 1)
@@ -528,7 +542,9 @@ class CaptureLoop:
 
         # A reboot marker may also terminate a crash. Finish the old crash before
         # incrementing the boot so it is attributed to the boot that actually failed.
-        report = self._crash.feed(parsed.msg)
+        report = self._crash.feed(parsed.msg, parsed.level)
+        if self._crash.in_crash:
+            self._last_crash_line = time.monotonic()
         if report is not None:
             self._emit_crash(report)
 
@@ -575,13 +591,23 @@ class CaptureLoop:
                     self._unresolved_crashes.popitem()
             self._drain_symbolizations()
 
+    def _addr2line_for(self, elf_path: str) -> str | None:
+        """Resolve the tool once per ELF; the answer depends on its architecture."""
+        if elf_path not in self._addr2line_cache:
+            if len(self._addr2line_cache) >= 16:
+                self._addr2line_cache.clear()
+            self._addr2line_cache[elf_path] = find_addr2line(elf_path)
+        return self._addr2line_cache[elf_path]
+
     def _drain_symbolizations(self) -> None:
-        tool = find_addr2line()
-        if tool is None:
-            return
         while self._decode_slots.acquire(blocking=False):
             with self._symbolization_lock:
                 if self._active_elf is None or not self._unresolved_crashes:
+                    self._decode_slots.release()
+                    return
+                tool = self._addr2line_for(self._active_elf)
+                if tool is None:
+                    # Keep the crash pending: a later ELF may have a tool.
                     self._decode_slots.release()
                     return
                 # Decode oldest-first, matching the eviction policy above.

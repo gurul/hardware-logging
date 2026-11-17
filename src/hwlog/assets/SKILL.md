@@ -28,13 +28,16 @@ for subsequent queries. CLI queries accept `--session ID`.
    This takes an exclusive pause lease so the flasher can use the port, resumes
    after, and conservatively archives at most one unambiguous ELF candidate for
    later symbolization. Generic flash commands cannot prove which ELF was used.
-3. **Verify behavior, not compilation:** `hwlog wait --pattern "setup done" --timeout 20`.
-   Exit 0 = seen, 1 = timeout. A post-flash wait includes output captured since
+3. **Verify behavior, not compilation:**
+   `hwlog wait --pattern "setup done" --timeout 20 --fail-on-crash`.
+   Exit 0 = seen, 1 = timeout, 3 = the firmware crashed first (go to
+   `hwlog crashes --last`; do not wait again). A post-flash wait includes output captured since
    the flash boundary, even if it arrived before the wait command began. "It
    flashed" is not "it works" — always gate on an expected log line.
 4. **Query small, escalate deliberately:**
    - `hwlog summary --json` — counts, recent faults, firmware and scan/storage coverage
    - `hwlog logs --boot -1 --tail 50` — latest boot only (start here)
+   - `hwlog logs --boot -2 --tail 50` — the boot before it (what ran before the reset)
    - `hwlog logs --level E` — errors across the session
    - `hwlog logs --grep wifi --tail 30` — targeted
    - `hwlog boots` — reboot-loop check: many short boots = crashing at startup
@@ -52,7 +55,8 @@ for subsequent queries. CLI queries accept `--session ID`.
 | Signature | Meaning | First moves |
 |---|---|---|
 | `Guru Meditation Error ... LoadProhibited/StoreProhibited` | Bad pointer deref (often NULL or freed memory) | `hwlog crashes --last`; decoded top frame is usually the culprit |
-| `Backtrace: 0x...` undecoded | No ELF archived for this build | Reflash via `hwlog flash` so the ELF gets archived; addr2line needs the exact build |
+| `Backtrace: 0x...` undecoded | No ELF archived for this build, or no `addr2line` for its architecture | Reflash via `hwlog flash` so the ELF gets archived; addr2line needs the exact build. hwlog finds PlatformIO, ESP-IDF and Arduino toolchains by itself |
+| RISC-V panic (`MEPC`/`RA` dump, no `Backtrace:`) | ESP32-C3/C6/H2 fault | `hwlog crashes --last` decodes the faulting address and its caller; read `MCAUSE`/`MTVAL` in the raw lines for the fault type and address |
 | `Task watchdog got triggered` | A task hogged the CPU (busy loop, missing `vTaskDelay`) | Look at the task name in the message; check loops added recently |
 | `Interrupt wdt timeout` | ISR or critical section too long | Recent ISR/timer changes |
 | `Brownout detector was triggered` | Power sag, not software | USB cable/port/power; peripherals drawing too much on boot |

@@ -186,7 +186,11 @@ def test_wait_for_pattern_rejects_oversized_regex(make_session):
 def test_wait_for_pattern_bounds_matched_record(make_session, monkeypatch):
     session = make_session([("I", "app", "needle " + "x" * 10_000)])
     record = next(mcp_server.query.iter_records(session))
-    monkeypatch.setattr(mcp_server.query, "wait_for_record", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(
+        mcp_server.query,
+        "wait_for_outcome",
+        lambda *_args, **_kwargs: mcp_server.query.WaitOutcome("matched", record),
+    )
 
     res = fn(mcp_server.wait_for_pattern)("needle", timeout_s=0, session=None)
 
